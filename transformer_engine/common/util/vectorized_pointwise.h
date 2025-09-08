@@ -544,13 +544,13 @@ __launch_bounds__(unary_kernel_threads) __global__
 
       if constexpr (std::is_same<Param, GptOssParam>::value) {
         // In case of GPT OSS, clamp the activation and gate values
-          const ComputeType limit = p.limit;
-          dgate_in = gate_in < limit && gate_in > -limit; // Derivative of clamp
-          gate_in = std::min(std::max(-limit, gate_in), limit) + 1.0f;
+        const ComputeType limit = p.limit;
+        dgate_in = gate_in < limit && gate_in > -limit;  // Derivative of clamp
+        gate_in = std::min(std::max(-limit, gate_in), limit) + 1.0f;
       }
 
       ComputeType after_dgelu = Dactivation(gelu_in, p) * grad_val * gate_in;
-      ComputeType after_dgate = dgate_in ? grad_val * Activation(gelu_in, p): 0.0f;
+      ComputeType after_dgate = dgate_in ? grad_val * Activation(gelu_in, p) : 0.0f;
 
       if (requires_amax) {
         __builtin_assume(max >= 0);
