@@ -1721,7 +1721,6 @@ class TestBasicOps:
         quantize_forward: bool,
         quantize_backward: bool,
     ):
-        print(_quantization_list)
         # Tensor dimensions
         in_shape = list(out_shape)
         in_shape[-1] *= 2
