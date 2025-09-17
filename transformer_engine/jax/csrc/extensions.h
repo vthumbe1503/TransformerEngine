@@ -48,7 +48,7 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(DActLuDBiasQuantizeHandler);
 
 pybind11::tuple GetDActDBiasQuantizeWorkspaceSizes(size_t batch_size, size_t hidden_size,
                                                    DType in_dtype, DType out_dtype,
-                                                   JAXX_Scaling_Mode scaling_mode, bool is_2x);
+                                                   JAXX_Scaling_Mode scaling_mode, bool is_2x, float limit);
 
 // Normalization
 XLA_FFI_DECLARE_HANDLER_SYMBOL(NormForwardHandler);
