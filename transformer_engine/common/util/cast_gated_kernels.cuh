@@ -769,8 +769,8 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
                   act_x = x * s;
                   dact_x = x * s * (1 - s) + s;
                 } else {
-                  act_x = ActOP(x, {});
-                  dact_x = DActOP(x, {});
+                  act_x = ActOP(x, p);
+                  dact_x = DActOP(x, p);
                 }
               }
 
@@ -779,7 +779,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
               after_act_rowwise[j] = after_act_elt;
               after_gate_rowwise[j] = after_gate_elt;
             } else {
-              after_act_elt = ActOP(act_elt, {}) * gate_elt;
+              after_act_elt = ActOP(act_elt, p) * gate_elt;
               after_act_rowwise[j] = after_act_elt;
             }
 

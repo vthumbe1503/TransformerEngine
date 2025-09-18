@@ -154,7 +154,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActLuHandler, ActLuFFI,
 
 pybind11::tuple GetDActDBiasQuantizeWorkspaceSizes(size_t batch_size, size_t hidden_size,
                                                    DType in_dtype, DType out_dtype,
-                                                   JAXX_Scaling_Mode scaling_mode, bool is_2x, float limit) {
+                                                   JAXX_Scaling_Mode scaling_mode, bool is_2x) {
   auto input_shape = std::vector<size_t>{batch_size, hidden_size};
   auto dact_input_shape = std::vector<size_t>{batch_size, hidden_size};
   auto output_shape = std::vector<size_t>{batch_size, hidden_size};
