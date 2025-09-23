@@ -13,9 +13,9 @@ from jax import dtypes
 from jax.experimental.custom_partitioning import SdyShardingRule
 from jax.sharding import PartitionSpec
 
+import numpy as np
 import transformer_engine_jax
 from transformer_engine_jax import NVTE_Activation_Type
-
 from .base import BasePrimitive, register_primitive
 from .misc import (
     jax_dtype_to_te_dtype,
@@ -36,6 +36,7 @@ from ..quantize import (
     DelayedScaleQuantizer,
     ScalingMode,
 )
+from ..activation import ActivationParams
 
 if version.parse(jax.__version__) >= version.parse("0.5.0"):
     from jax import ffi  # pylint: disable=ungrouped-imports
@@ -56,17 +57,27 @@ ActivationEnum = {
     ("quick_gelu", "linear"): NVTE_Activation_Type.QGEGLU,
     ("squared_relu",): NVTE_Activation_Type.SRELU,
     ("squared_relu", "linear"): NVTE_Activation_Type.SREGLU,
+    ("clamped_silu", "clamped_linear"): NVTE_Activation_Type.CLAMPED_SWIGLU,
 }
 
 
-def _convert_to_activation_function(fn_or_string):
+def _convert_to_activation_function(fn_or_string, act_params: ActivationParams):
     """Convert a string to an activation function."""
     if fn_or_string == "linear":
         return lambda x: x
+    if fn_or_string == "clamped_linear":
+        limit = act_params.clamped_swiglu.limit
+        return lambda x: jnp.clip(x, min=-limit, max=limit) + 1
     if fn_or_string == "quick_gelu":
         return lambda x: jax.nn.sigmoid(1.702 * x) * x
     if fn_or_string == "squared_relu":
         return lambda x: reduce(operator.mul, [jax.nn.relu(x), jax.nn.relu(x)])
+    if fn_or_string == "clamped_silu":
+        limit = act_params.clamped_swiglu.limit
+        alpha = act_params.clamped_swiglu.alpha
+        return lambda x: jax.nn.sigmoid(
+            alpha * jnp.minimum(x, limit)
+        ) * jnp.minimum(x, limit)
     if isinstance(fn_or_string, str):
         return getattr(jax.nn, fn_or_string)
     if callable(fn_or_string):
@@ -89,7 +100,8 @@ class ActLuPrimitive(BasePrimitive):
         6,
         7,
         8,
-    )  # out_dtype, act_enum, act_len, scaling_mode, is_2x, scale_dtype, is_outer
+        9,
+    )  # out_dtype, act_enum, act_len, scaling_mode, is_2x, scale_dtype, is_outer, act_params
     inner_primitive = None
     outer_primitive = None
 
@@ -105,11 +117,12 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
     ):
         """
         te_act_lu_p abstract
         """
-        del act_enum
+        del act_enum, act_params
         dtype = dtypes.canonicalize_dtype(x_aval.dtype)
         assert dtype in [jnp.float32, jnp.float16, jnp.bfloat16]
         assert scale_aval is None or scale_aval.dtype == jnp.float32
@@ -155,6 +168,7 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
     ):
         """
         te_gated_act_lu_p lowering rules
@@ -163,9 +177,14 @@ class ActLuPrimitive(BasePrimitive):
         x_aval, scale_aval = ctx.avals_in
         assert x_aval.dtype in [jnp.float32, jnp.float16, jnp.bfloat16]
         assert scale_aval is None or scale_aval.dtype == jnp.float32
-
         out = ffi.ffi_lowering(ActLuPrimitive.name)(
-            ctx, x, scale, act_enum=act_enum, scaling_mode=scaling_mode.value, is_2x=is_2x
+            ctx,
+            x,
+            scale,
+            act_enum=act_enum,
+            scaling_mode=scaling_mode.value,
+            is_2x=is_2x,
+            act_params=act_params.to_ffi_lowering_dict(),
         )
         return out
 
@@ -180,6 +199,7 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
     ):
         """
         to describe implementation
@@ -198,6 +218,7 @@ class ActLuPrimitive(BasePrimitive):
                 is_2x=is_2x,
                 scale_dtype=scale_dtype,
                 is_outer=False,
+                act_params=act_params,
             )
         )
         rowwise_scale_inv_shape, colwise_scale_inv_shape = ScalingMode(
@@ -226,6 +247,7 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
     ):
         """
         to describe batch rules for vmap
@@ -247,6 +269,7 @@ class ActLuPrimitive(BasePrimitive):
                 scaling_mode=scaling_mode,
                 is_2x=is_2x,
                 scale_dtype=scale_dtype,
+                act_params=act_params,
             ),
             out_bdims,
         )
@@ -260,6 +283,7 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
         mesh,
         arg_infos,
         result_infos,
@@ -271,6 +295,7 @@ class ActLuPrimitive(BasePrimitive):
             scale_dtype,
             act_len,
             is_outer,
+            act_params,
         )  # Unused.
         x_spec = get_padded_spec(arg_infos[0])
         scale_spec = get_padded_spec(arg_infos[1])
@@ -323,6 +348,7 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
         mesh,
         arg_infos,
         result_infos,
@@ -383,6 +409,7 @@ class ActLuPrimitive(BasePrimitive):
                     is_2x=is_2x,
                     scale_dtype=scale_dtype,
                     is_outer=True,
+                    act_params=act_params,
                 )
             )
 
@@ -410,11 +437,12 @@ class ActLuPrimitive(BasePrimitive):
         is_2x,
         scale_dtype,
         is_outer,
+        act_params,
         mesh,
         value_types,
         result_types,
     ):
-        del out_dtype, act_enum, act_len, scale_dtype, is_outer, mesh, result_types
+        del out_dtype, act_enum, act_len, scale_dtype, is_outer, mesh, result_types, act_params
         prefix = "ActLuPrimitive_"
         x_rank = len(value_types[0].shape)
         scale_rules = ScalingMode(scaling_mode).get_shardy_sharding_rules(
@@ -458,8 +486,8 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
 
     name = "te_dact_dbias_quantize_ffi"
     multiple_results = True
-    # out_dtype, scaling_mode, is_2x, scale_dtype, is_dbias, act_enum, act_len, is_outer
-    impl_static_args = (3, 4, 5, 6, 7, 8, 9, 10)
+    # out_dtype, scaling_mode, is_2x, scale_dtype, is_dbias, act_enum, act_len, is_outer, act_params
+    impl_static_args = (3, 4, 5, 6, 7, 8, 9, 10, 11)
     inner_primitive = None
     outer_primitive = None
 
@@ -477,6 +505,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
     ):
         """
         te_dact_dbias_quantize_p abstract
@@ -533,6 +562,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
                 jax_dtype_to_te_dtype(out_dtype),
                 scaling_mode,
                 is_2x,
+                act_params,
             )
             wkspace_shape = wkspace_info[0]
             wkspace_dtype = te_dtype_to_jax_dtype(wkspace_info[1])
@@ -578,6 +608,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
     ):
         """
         te_dact_dbias_quantize_p lowering rules
@@ -596,6 +627,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
             is_2x=is_2x,
             is_dbias=is_dbias,
             act_enum=int(act_enum),
+            act_params=act_params.to_ffi_lowering_dict(),
         )
 
     @staticmethod
@@ -611,6 +643,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
     ):
         """
         te_dact_dbias_quantize_p impl
@@ -630,6 +663,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
                 act_enum=act_enum,
                 act_len=act_len,
                 is_outer=False,
+                act_params=act_params,
             )
         )
         rowwise_scale_inv_shape, colwise_scale_inv_shape = ScalingMode(
@@ -658,6 +692,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
     ):
         """
         to describe batch rules for vmap
@@ -688,6 +723,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
                 is_dbias=is_dbias,
                 act_enum=act_enum,
                 act_len=act_len,
+                act_params=act_params,
             ),
             out_bdims,
         )
@@ -702,11 +738,12 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
         mesh,
         arg_infos,
         result_infos,
     ):
-        del out_dtype, result_infos, act_enum
+        del out_dtype, result_infos, act_enum, act_params
         del scale_dtype, act_len, is_outer
         x_spec = get_padded_spec(arg_infos[1])
         scale_spec = get_padded_spec(arg_infos[2])
@@ -777,6 +814,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
         mesh,
         arg_infos,
         result_infos,
@@ -857,6 +895,7 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
                     act_enum=act_enum,
                     act_len=act_len,
                     is_outer=True,
+                    act_params=act_params,
                 )
             )
             if is_dbias:
@@ -883,11 +922,12 @@ class BaseDActLuDBiasQuantizePrimitive(BasePrimitive):
         act_enum,
         act_len,
         is_outer,
+        act_params,
         mesh,
         value_types,
         result_types,
     ):
-        del out_dtype, scale_dtype, act_enum, act_len, is_outer, mesh, result_types
+        del out_dtype, scale_dtype, act_enum, act_len, is_outer, mesh, result_types, act_params
         prefix = "BaseDActLuDBiasQuantizePrimitive_"
         scale_rules = ScalingMode(scaling_mode).get_shardy_sharding_rules(
             len(value_types[1].shape), unique_var=prefix + "x", flatten_axis=-2
@@ -922,20 +962,22 @@ class DActLuQuantizePrimitive(BaseDActLuDBiasQuantizePrimitive):
     """Subclass of BaseDActLuDBiasQuantizePrimitive for fused activation quantization without dbias. No change in functionality from the base primitive but named differently for use in more granular disabling of primitives via NVTE_JAX_CUSTOM_CALLS."""
 
 
-def _jax_act_lu(inputs, activation_type, quantizer=None) -> Union[NoScaleTensor, ScaledTensor]:
+def _jax_act_lu(
+    inputs, activation_type, quantizer=None, act_params: Optional[ActivationParams] = None
+) -> Union[NoScaleTensor, ScaledTensor]:
     """
     JAX native activation implementation
     """
+    act_params = act_params if act_params is not None else ActivationParams()
     act_len = len(activation_type)
     assert inputs.shape[-2] == act_len, (
         "activation input should be replicated by act_len in the -2 axis, got input shape"
         f" {inputs.shape} and act_len {act_len}"
     )
-
     x = jnp.split(inputs, act_len, axis=-2)
     acts = []
     for idx, act_fn in enumerate(activation_type):
-        x_i = _convert_to_activation_function(act_fn)(x[idx])
+        x_i = _convert_to_activation_function(act_fn, act_params)(x[idx])
         acts.append(x_i)
     x = reduce(operator.mul, acts)
     x = jnp.squeeze(x, axis=-2)
@@ -950,10 +992,12 @@ def _jax_quantize_dact_dbias(
     activation_type: Sequence[Union[str, Callable]],
     is_dbias: bool = True,
     quantizer: Optional[Quantizer] = None,
+    act_params: Optional[ActivationParams] = None,
 ):
     """
     JAX implementation of dact_lu and dbias with optional quantization
     """
+    act_params = act_params if act_params is not None else ActivationParams()
     act_len = len(activation_type)
     assert x.shape[-2] == act_len, (
         "activation input should be replicated by act_len in the -2 axis, got input shape"
@@ -961,7 +1005,8 @@ def _jax_quantize_dact_dbias(
     )
 
     _, vjp_func = jax.vjp(
-        partial(_jax_act_lu, activation_type=activation_type), x.astype(jnp.float32)
+        partial(_jax_act_lu, activation_type=activation_type, act_params=act_params),
+        x.astype(jnp.float32),
     )
     # VJP is using non-quantized backward for dact, so the input should always be wrapped in NoScaleTensor regardless of whether the forward pass used quantization or this dact will quantize afterwards.
     dz = NoScaleTensor(data=dz.astype(jnp.float32), amax=None)
@@ -980,10 +1025,12 @@ def _jax_quantize_dact_dbias(
     return dx, dbias
 
 
+
 def act_lu(
     x: jnp.ndarray,
     activation_type: Sequence[Union[str, Callable]],
     quantizer: Optional[Quantizer] = None,
+    act_params: Optional[ActivationParams] = None,
 ) -> Union[jnp.ndarray, ScaledTensor]:
     """Activation with optional quantization.
 
@@ -1005,24 +1052,22 @@ def act_lu(
         "activation input should be replicated by act_len in the -2 axis, got input shape"
         f" {x.shape} and act_len {act_len}"
     )
-
+    act_params = act_params if act_params is not None else ActivationParams()
     if not ActLuPrimitive.enabled():
-        return _jax_act_lu(x, activation_type, quantizer)
+        return _jax_act_lu(x, activation_type, quantizer, act_params)
 
     # TE/common does not support colwise-only quantization yet
     if quantizer is not None and quantizer.q_layout == QuantizeLayout.COLWISE:
-        return _jax_act_lu(x, activation_type, quantizer)
-
+        return _jax_act_lu(x, activation_type, quantizer, act_params)
     # TE/common does not support 2x quantization for DelayedScaling yet
     war_output = try_apply_delayed_scaling_2x_war(
-        f=act_lu, x=x, activation_type=activation_type, quantizer=quantizer
+        f=act_lu, x=x, activation_type=activation_type, quantizer=quantizer, act_params=act_params
     )
     if war_output is not None:
         return war_output
 
     scale = jnp.empty((1,), jnp.float32)
     output_shape = (*x.shape[:-2], x.shape[-1])
-
     if quantizer is None:
         out, _, _, _, _ = ActLuPrimitive.outer_primitive.bind(
             x,
@@ -1034,6 +1079,7 @@ def act_lu(
             is_2x=False,
             scale_dtype=jnp.float32,
             is_outer=True,
+            act_params=act_params,
         )
         out = out.reshape(output_shape)
         out = NoScaleTensor(
@@ -1048,10 +1094,10 @@ def act_lu(
             x=x,
             activation_type=activation_type,
             quantizer=None,
+            act_params=act_params,
         )
         out, _ = _quantize_dbias_impl(out, is_dbias=False, quantizer=quantizer, dq_dtype=x.dtype)
         return out
-
     if isinstance(quantizer, DelayedScaleQuantizer):
         scale = quantizer.scale
 
@@ -1071,6 +1117,7 @@ def act_lu(
         is_2x=quantizer.is_2x2x(),
         scale_dtype=quantizer.get_scale_dtype(),
         is_outer=True,
+        act_params=act_params,
     )
 
     quantizer.update(updated_amax)
@@ -1093,6 +1140,7 @@ def quantize_dact_dbias(
     activation_type: Sequence[Union[str, Callable]] = ("gelu",),
     is_dbias: bool = True,
     quantizer: Optional[Quantizer] = None,
+    act_params: Optional[ActivationParams] = None,
 ) -> Tuple[ScaledTensor, jnp.ndarray]:
     """Compute gradients of activation and bias with optional quantization.
 
@@ -1109,7 +1157,7 @@ def quantize_dact_dbias(
         - The gradient of the activation with respect to the input.
         - The gradient of the activation with respect to the bias.
     """
-
+    act_params = act_params if act_params is not None else ActivationParams()
     act_len = len(activation_type)
     assert x.shape[-2] == act_len, (
         "activation input should be replicated by act_len in the -2 axis, got input shape"
@@ -1122,8 +1170,7 @@ def quantize_dact_dbias(
     if not PrimitiveClass.enabled() or (
         quantizer is not None and quantizer.q_layout == QuantizeLayout.COLWISE
     ):
-        return _jax_quantize_dact_dbias(dz, x, activation_type, is_dbias, quantizer)
-
+        return _jax_quantize_dact_dbias(dz, x, activation_type, is_dbias, quantizer, act_params)
     if quantizer is None:
         output, _, _, _, _, _ = PrimitiveClass.outer_primitive.bind(
             dz,
@@ -1139,6 +1186,7 @@ def quantize_dact_dbias(
             act_enum=act_type_id,
             act_len=act_len,
             is_outer=True,
+            act_params=act_params,
         )
         output = output.astype(x.dtype)
         dbias = None
@@ -1154,7 +1202,11 @@ def quantize_dact_dbias(
     # TE/common does not support 1x dact_dbias_quantize on arch < 100 yet
     if should_apply_1x_fused_dbias_war_for_arch_l_100(is_dbias=is_dbias, quantizer=quantizer):
         out = dact_lu(
-            dz.astype(jnp.float32), x.astype(jnp.float32), activation_type, quantizer=None
+            dz.astype(jnp.float32),
+            x.astype(jnp.float32),
+            activation_type,
+            quantizer=None,
+            act_params=act_params,
         )
         return _quantize_dbias_impl(
             out.data, quantizer, is_dbias=True, dq_dtype=x.dtype, flatten_axis=-2
@@ -1171,6 +1223,7 @@ def quantize_dact_dbias(
             is_dbias=is_dbias,
             quantizer=quantizer,
             flatten_axis=-2,
+            act_params=act_params,
         )
         if war_output is not None:
             return war_output
@@ -1178,10 +1231,11 @@ def quantize_dact_dbias(
     if quantizer.scaling_mode == ScalingMode.CURRENT_TENSOR_SCALING:
         # Current scaling does not support fused operations. Perform dact in higher precision then quantize after.
         out = dact_lu(
-            dz=dz,
-            x=x,
+            dz=dz.astype(jnp.float32),
+            x=x.astype(jnp.float32),
             activation_type=activation_type,
             quantizer=None,
+            act_params=act_params,
         )
         out, dbias = _quantize_dbias_impl(
             out.data, is_dbias=is_dbias, quantizer=quantizer, dq_dtype=x.dtype, flatten_axis=-2
@@ -1194,7 +1248,10 @@ def quantize_dact_dbias(
     # TE/common dact_dbias_quantize does not support gated act yet
     if is_dbias and is_gated:
         dgated = dact_lu(
-            dz.astype(jnp.float32), x.astype(jnp.float32), activation_type=activation_type
+            dz.astype(jnp.float32),
+            x.astype(jnp.float32),
+            activation_type=activation_type,
+            act_params=act_params,
         )
         out, dbias = _quantize_dbias_impl(
             dgated, quantizer, is_dbias=True, dq_dtype=x.dtype, flatten_axis=-2
@@ -1220,6 +1277,7 @@ def quantize_dact_dbias(
         act_enum=act_type_id,
         act_len=act_len,
         is_outer=True,
+        act_params=act_params,
     )
 
     # For DelayedScaling transpose, the scale buffer is shared for both rowwise and colwise
@@ -1248,6 +1306,7 @@ def dact_lu(
     x: jnp.ndarray,
     activation_type: Sequence[Union[str, Callable]],
     quantizer: Optional[Quantizer] = None,
+    act_params: Optional[ActivationParams] = None,
 ) -> Union[jnp.ndarray, ScaledTensor]:
     """
     Backward pass for activation with optional quantization.
@@ -1261,11 +1320,13 @@ def dact_lu(
     Returns:
         The gradient of the activation with respect to the input.
     """
+    act_params = act_params if act_params is not None else ActivationParams()
     output, _ = quantize_dact_dbias(
         dz=dz,
         x=x,
         activation_type=activation_type,
         is_dbias=False,
         quantizer=quantizer,
+        act_params=act_params,
     )
     return output
