@@ -1378,6 +1378,7 @@ class Linear(TransformerEngineBaseModule):
                     elif self.parallel_mode == "column":
                         set_tensor_model_parallel_attributes(getattr(self, bias), True, 0, 1)
 
+    @no_torch_dynamo(recursive=False)
     def forward(
         self,
         inp: torch.Tensor,
@@ -1677,9 +1678,3 @@ class Linear(TransformerEngineBaseModule):
                 self.quantizers["scaling_bwd"][
                     tex.FP8BwdTensors.GRAD_OUTPUT1
                 ].all_gather_usage = True
-
-# disable torch dynamo just once to reduce wrapped function overhead on each
-# forward call of te Linear.
-if torch.__version__ >= "2":
-    Linear.forward._torchdynamo_disable = True
-    Linear.forward._torchdynamo_disable_msg = None
