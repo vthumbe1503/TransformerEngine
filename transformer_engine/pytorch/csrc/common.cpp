@@ -13,29 +13,23 @@
 namespace transformer_engine::pytorch {
 
 /*! convert fp4 data shape back to original shape */
-std::vector<size_t> convert_shape_back_from_fp4(const std::vector<size_t>& shape, bool transpose) {
-  std::vector<size_t> ret;
+NVTEShape convert_shape_back_from_fp4(const NVTEShape& shape, bool transpose) {
+  NVTEShapeWrapper ret;
+  const NVTEShapeWrapper input_shape(shape);
   size_t start_idx = (transpose) ? 1 : 0;
-  for (size_t i = start_idx; i < shape.size() - 1; ++i) {
-    ret.push_back(shape[i]);
+  for (size_t i = start_idx; i < input_shape.size() - 1; ++i) {
+    ret.push_back(input_shape[i]);
   }
-  ret.push_back(shape.back() * 2);
+  ret.push_back(input_shape.back() * 2);
   if (transpose) {
-    ret.push_back(shape.front());
+    ret.push_back(input_shape.front());
   }
-  return ret;
+  return static_cast<NVTEShape>(ret);
 }
 
-std::vector<size_t> getTensorShape(const at::Tensor& t) {
-  std::vector<size_t> shape;
-  for (auto s : t.sizes()) {
-    shape.push_back(s);
-  }
-  return shape;
-}
-
-NVTEShape convertTorchShape(const c10::IntArrayRef torch_shape) {
+NVTEShape getTensorShape(const at::Tensor& t) {
   NVTEShape ret;
+  const c10::IntArrayRef& torch_shape = t.sizes();
   ret.ndim = torch_shape.size();
   constexpr int max_dimensions = sizeof(ret.data) / sizeof(size_t);
   NVTE_CHECK(ret.ndim < max_dimensions,
@@ -46,6 +40,23 @@ NVTEShape convertTorchShape(const c10::IntArrayRef torch_shape) {
     ret.data[i] = static_cast<size_t>(v);
   }
   return ret;
+}
+
+template <typename T>
+NVTEShape make_nvte_1d_shape(T dim0) {
+  NVTEShape shape;
+  shape.ndim = 1;
+  shape.data[0] = static_cast<size_t>(dim0);
+  return shape;
+}
+
+template <typename T, typename U>
+NVTEShape make_nvte_2d_shape(T dim0, U dim1) {
+  NVTEShape shape;
+  shape.ndim = 2;
+  shape.data[0] = static_cast<size_t>(dim0);
+  shape.data[1] = static_cast<size_t>(dim1);
+  return shape;
 }
 
 std::unique_ptr<Quantizer> convert_quantizer(py::handle quantizer) {
@@ -112,17 +123,9 @@ transformer_engine::TensorWrapper makeTransformerEngineTensor(
   return transformer_engine::TensorWrapper(data_ptr, shape, type);
 }
 
-transformer_engine::TensorWrapper makeTransformerEngineTensor(
-    void* data_ptr, const std::vector<size_t>& shape, const transformer_engine::DType type) {
-  return transformer_engine::TensorWrapper(data_ptr, shape, type);
-}
-
 transformer_engine::TensorWrapper makeTransformerEngineTensor(at::Tensor tensor) {
   transformer_engine::DType dtype = GetTransformerEngineDType(tensor.scalar_type());
-  std::vector<size_t> shape;
-  for (auto s : tensor.sizes()) {
-    shape.push_back(s);
-  }
+  NVTEShape shape = getTensorShape(tensor);
   return makeTransformerEngineTensor(tensor.data_ptr(), shape, dtype);
 }
 
@@ -164,14 +167,13 @@ makeTransformerEngineTensorList(std::vector<std::vector<at::Tensor>> at_tensor_l
 }
 
 transformer_engine::TensorWrapper makeTransformerEngineTensor(
-    void* data_ptr, const std::vector<size_t>& shape, const transformer_engine::DType type,
-    void* amax_ptr, void* scale_ptr, void* scale_inv_ptr, std::vector<size_t> scale_inv_shape,
+    void* data_ptr, const NVTEShape& shape, const transformer_engine::DType type, void* amax_ptr,
+    void* scale_ptr, void* scale_inv_ptr, const NVTEShape& scale_inv_shape,
     NVTEScalingMode scaling_mode) {
   TensorWrapper ret(scaling_mode);
   ret.set_rowwise_data(data_ptr, type, shape);
-  const std::vector<size_t> meta_shape{1};
-  ret.set_amax(amax_ptr, DType::kFloat32, meta_shape);
-  ret.set_scale(scale_ptr, DType::kFloat32, meta_shape);
+  ret.set_amax(amax_ptr, DType::kFloat32, TensorWrapper::defaultShape);
+  ret.set_scale(scale_ptr, DType::kFloat32, TensorWrapper::defaultShape);
   auto scale_inv_dtype =
       (scaling_mode == NVTE_MXFP8_1D_SCALING) ? DType::kFloat8E8M0 : DType::kFloat32;
   ret.set_rowwise_scale_inv(scale_inv_ptr, scale_inv_dtype, scale_inv_shape);
@@ -179,17 +181,16 @@ transformer_engine::TensorWrapper makeTransformerEngineTensor(
 }
 
 transformer_engine::TensorWrapper makeTransformerEngineTensor(
-    void* data_ptr, void* columnwise_data_ptr, const std::vector<size_t>& shape,
-    const std::vector<size_t>& columnwise_shape, const transformer_engine::DType type,
-    void* amax_ptr, void* scale_ptr, void* scale_inv_ptr, void* columnwise_scale_inv_ptr,
-    const std::vector<size_t>& scale_inv_shape,
-    const std::vector<size_t>& columnwise_scale_inv_shape, NVTEScalingMode scaling_mode) {
+    void* data_ptr, void* columnwise_data_ptr, const NVTEShape& shape,
+    const NVTEShape& columnwise_shape, const transformer_engine::DType type, void* amax_ptr,
+    void* scale_ptr, void* scale_inv_ptr, void* columnwise_scale_inv_ptr,
+    const NVTEShape& scale_inv_shape, const NVTEShape& columnwise_scale_inv_shape,
+    NVTEScalingMode scaling_mode) {
   TensorWrapper ret(scaling_mode);
   ret.set_rowwise_data(data_ptr, type, shape);
   ret.set_columnwise_data(columnwise_data_ptr, type, columnwise_shape);
-  const std::vector<size_t> meta_shape{1};
-  ret.set_amax(amax_ptr, DType::kFloat32, meta_shape);
-  ret.set_scale(scale_ptr, DType::kFloat32, meta_shape);
+  ret.set_amax(amax_ptr, DType::kFloat32, TensorWrapper::defaultShape);
+  ret.set_scale(scale_ptr, DType::kFloat32, TensorWrapper::defaultShape);
   auto scale_inv_dtype = (scaling_mode == NVTE_MXFP8_1D_SCALING)   ? DType::kFloat8E8M0
                          : (scaling_mode == NVTE_NVFP4_1D_SCALING) ? DType::kFloat8E4M3
                                                                    : DType::kFloat32;
@@ -230,6 +231,9 @@ template size_t product<size_t>(const std::vector<size_t>& shape);
 template int64_t product<int64_t>(const std::vector<int64_t>& shape);
 
 size_t product(const NVTEShape& shape, size_t begin, size_t end) {
+  if (end == -1) {
+    end = shape.ndim;
+  }
   NVTE_CHECK(begin <= end && end <= shape.ndim, "Attempted to access entries ", begin, " to ", end,
              " in a shape with ", shape.ndim, " entries");
   size_t ret = 1;
@@ -321,5 +325,17 @@ at::PhiloxCudaState init_philox_state(at::CUDAGeneratorImpl* gen, size_t elts_pe
   philox_args = gen->philox_cuda_state(elts_per_thread);
   return philox_args;
 }
+
+// Explicit template instantiations for make_nvte_1d_shape
+template NVTEShape make_nvte_1d_shape<int>(int dim0);
+template NVTEShape make_nvte_1d_shape<int64_t>(int64_t dim0);
+template NVTEShape make_nvte_1d_shape<size_t>(size_t dim0);
+
+// Explicit template instantiations for make_nvte_2d_shape
+template NVTEShape make_nvte_2d_shape<int64_t, int64_t>(int64_t dim0, int64_t dim1);
+template NVTEShape make_nvte_2d_shape<size_t, size_t>(size_t dim0, size_t dim1);
+template NVTEShape make_nvte_2d_shape<int64_t, size_t>(int64_t dim0, size_t dim1);
+template NVTEShape make_nvte_2d_shape<size_t, int64_t>(size_t dim0, int64_t dim1);
+template NVTEShape make_nvte_2d_shape<int64_t, int>(int64_t dim0, int dim1);
 
 }  // namespace transformer_engine::pytorch

@@ -19,7 +19,7 @@ at::Tensor fp8_transpose(at::Tensor input, DType otype, std::optional<at::Tensor
   init_extension();
 
   // Tensor dimensions
-  const auto shape = getTensorShape(input);
+  const NVTEShapeWrapper shape = getTensorShape(input);
   std::vector<int64_t> transpose_shape_int64;
   if (shape.size() > 0) {
     transpose_shape_int64.push_back(shape.back());
@@ -45,8 +45,8 @@ at::Tensor fp8_transpose(at::Tensor input, DType otype, std::optional<at::Tensor
   }
 
   // Compute transpose
-  auto input_cu = makeTransformerEngineTensor(input.data_ptr(), std::vector<size_t>{M, N}, otype);
-  auto output_cu = makeTransformerEngineTensor(out.data_ptr(), std::vector<size_t>{N, M}, otype);
+  auto input_cu = makeTransformerEngineTensor(input.data_ptr(), make_nvte_2d_shape(M, N), otype);
+  auto output_cu = makeTransformerEngineTensor(out.data_ptr(), make_nvte_2d_shape(N, M), otype);
   nvte_transpose(input_cu.data(), output_cu.data(), at::cuda::getCurrentCUDAStream());
 
   return out;
@@ -60,7 +60,7 @@ at::Tensor swap_first_dims(at::Tensor tensor, std::optional<at::Tensor> out) {
 
   // Allocate output tensor if needed
   if (!out) {
-    auto in_shape = getTensorShape(input);
+    const NVTEShapeWrapper in_shape = getTensorShape(input);
     NVTE_CHECK(in_shape.size() >= 2, "Invalid input tensor dimensions (shape=", in_shape, ")");
     std::vector<int64_t> out_shape_int64(in_shape.begin(), in_shape.end());
     out_shape_int64[0] = static_cast<int64_t>(in_shape[1]);
