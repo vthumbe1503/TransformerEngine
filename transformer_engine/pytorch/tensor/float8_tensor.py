@@ -910,6 +910,13 @@ class Float8Tensor(Float8TensorStorage, QuantizedTensor):
         )
         return out, all_gather_outputs
 
+    @property
+    def shape(self):
+        return self._data.shape if self._data is not None else self._transpose.shape
+    @property
+    def is_cuda(self):
+        return self._data.is_cuda if self._data is not None else self._transpose.is_cuda
+
     @classmethod
     def _make_in_reduce_ex(
         cls,
@@ -943,7 +950,6 @@ class Float8Tensor(Float8TensorStorage, QuantizedTensor):
     def _get_data(self) -> Float8Tensor:
         """Get tensor data property"""
         return super().data
-
     @torch.no_grad()
     def _set_data(self, tensor: torch.Tensor) -> None:
         """Set tensor data property

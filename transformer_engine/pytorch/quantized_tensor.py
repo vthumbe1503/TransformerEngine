@@ -350,6 +350,7 @@ class QuantizedTensor(torch.Tensor):
     ):
         # We are assuming only contiguous tensors
         stride = _stride_from_shape(shape)
+        
         instance = torch.Tensor._make_wrapper_subclass(
             cls,
             shape,
@@ -360,8 +361,12 @@ class QuantizedTensor(torch.Tensor):
             requires_grad=requires_grad,
             device=torch.cuda.current_device() if device is None else device,
         )
-
+        instance._dtype = dtype
         return instance
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def dequantize(self, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """Convert quantized data to standard PyTorch tensor"""

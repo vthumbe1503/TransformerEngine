@@ -187,20 +187,50 @@ std::pair<TensorWrapper, py::object> Float8Quantizer::create_tensor(
     scale_inv = at::reciprocal(scale);
   }
 
-  // Construct Python FP8 tensor
+  // Construct Python FP8 tensor using direct C API for better performance
   py::object out_py;
+  py::object scale_inv_py = py::cast(*scale_inv);
+  
   if (internal) {
-    py::handle Float8TensorClass(reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass));
-    out_py = Float8TensorClass("data"_a = data_py, "fp8_scale_inv"_a = *scale_inv,
-                               "fp8_dtype"_a = this->dtype, "data_transpose"_a = transpose_py,
-                               "quantizer"_a = this->quantizer);
+    // Use direct C API call bypassing pybind11 overhead
+    PyObject* kwargs = PyDict_New();
+    PyDict_SetItemString(kwargs, "data", data_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_scale_inv", scale_inv_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
+    PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
+    PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
+    
+    PyObject* result = PyObject_Call(
+        reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass),
+        PyTuple_New(0),
+        kwargs);
+    
+    Py_DECREF(kwargs);
+    
+    NVTE_CHECK(result != nullptr, "Failed to create Float8TensorStorage instance");
+    out_py = py::reinterpret_steal<py::object>(result);
   } else {
-    py::handle Float8TensorClass(reinterpret_cast<PyObject*>(Float8TensorPythonClass));
     const std::vector<int64_t> shape_int64(shape.data, shape.data + shape.ndim);
-    out_py = Float8TensorClass("shape"_a = shape_int64, "dtype"_a = GetATenDType(dtype),
-                               "data"_a = data_py, "fp8_scale_inv"_a = *scale_inv,
-                               "fp8_dtype"_a = this->dtype, "data_transpose"_a = transpose_py,
-                               "quantizer"_a = this->quantizer);
+    
+    // Use direct C API call bypassing pybind11 overhead
+    PyObject* kwargs = PyDict_New();
+    PyDict_SetItemString(kwargs, "shape", py::cast(shape_int64).ptr());
+    PyDict_SetItemString(kwargs, "dtype", py::cast(GetATenDType(dtype)).ptr());
+    PyDict_SetItemString(kwargs, "data", data_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_scale_inv", scale_inv_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
+    PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
+    PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
+    
+    PyObject* result = PyObject_Call(
+        reinterpret_cast<PyObject*>(Float8TensorPythonClass),
+        PyTuple_New(0),
+        kwargs);
+    
+    Py_DECREF(kwargs);
+    
+    NVTE_CHECK(result != nullptr, "Failed to create Float8Tensor instance");
+    out_py = py::reinterpret_steal<py::object>(result);
   }
 
   // Construct C++ FP8 tensor
@@ -398,18 +428,48 @@ std::pair<TensorWrapper, py::object> Float8CurrentScalingQuantizer::create_tenso
   py::object out_py;
   py::object data_py = with_data ? py::cast(data_tensor) : py::none();
   py::object transpose_py = with_transpose ? py::cast(transpose_tensor) : py::none();
+  py::object scale_inv_py = py::cast(scale_inv_tensor);
+  
   if (internal) {
-    py::handle Float8TensorClass(reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass));
-    out_py = Float8TensorClass("data"_a = data_py, "fp8_scale_inv"_a = scale_inv_tensor,
-                               "fp8_dtype"_a = this->dtype, "data_transpose"_a = transpose_py,
-                               "quantizer"_a = this->quantizer);
+    // Use direct C API call bypassing pybind11 overhead
+    PyObject* kwargs = PyDict_New();
+    PyDict_SetItemString(kwargs, "data", data_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_scale_inv", scale_inv_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
+    PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
+    PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
+    
+    PyObject* result = PyObject_Call(
+        reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass),
+        PyTuple_New(0),
+        kwargs);
+    
+    Py_DECREF(kwargs);
+    
+    NVTE_CHECK(result != nullptr, "Failed to create Float8TensorStorage instance");
+    out_py = py::reinterpret_steal<py::object>(result);
   } else {
-    py::handle Float8TensorClass(reinterpret_cast<PyObject*>(Float8TensorPythonClass));
     const std::vector<int64_t> shape_int64(shape.data, shape.data + shape.ndim);
-    out_py = Float8TensorClass("shape"_a = shape_int64, "dtype"_a = GetATenDType(dtype),
-                               "data"_a = data_py, "fp8_scale_inv"_a = scale_inv_tensor,
-                               "fp8_dtype"_a = this->dtype, "data_transpose"_a = transpose_py,
-                               "quantizer"_a = this->quantizer);
+    
+    // Use direct C API call bypassing pybind11 overhead
+    PyObject* kwargs = PyDict_New();
+    PyDict_SetItemString(kwargs, "shape", py::cast(shape_int64).ptr());
+    PyDict_SetItemString(kwargs, "dtype", py::cast(GetATenDType(dtype)).ptr());
+    PyDict_SetItemString(kwargs, "data", data_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_scale_inv", scale_inv_py.ptr());
+    PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
+    PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
+    PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
+    
+    PyObject* result = PyObject_Call(
+        reinterpret_cast<PyObject*>(Float8TensorPythonClass),
+        PyTuple_New(0),
+        kwargs);
+    
+    Py_DECREF(kwargs);
+    
+    NVTE_CHECK(result != nullptr, "Failed to create Float8Tensor instance");
+    out_py = py::reinterpret_steal<py::object>(result);
   }
 
   // Construct C++ FP8 tensor
