@@ -21,7 +21,7 @@
 #include "common.h"
 
 namespace transformer_engine::pytorch {
-
+bool initialized = false;
 PyTypeObject *Float8TensorPythonClass = nullptr;  /// TODO Remove
 PyTypeObject *Float8TensorStoragePythonClass = nullptr;
 PyTypeObject *Float8QuantizerClass = nullptr;
@@ -105,10 +105,12 @@ void init_nvfp4_extensions() {
 }
 
 void init_extension() {
+  if (initialized) return;
   init_float8_extension();
   init_mxfp8_extension();
   init_float8blockwise_extension();
   init_nvfp4_extensions();
+  initialized = true;
 }
 
 }  // namespace transformer_engine::pytorch

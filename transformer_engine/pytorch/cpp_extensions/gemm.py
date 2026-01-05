@@ -12,7 +12,7 @@ import transformer_engine_torch as tex
 from ..constants import TE_DType
 from ..utils import get_sm_count, _empty_tensor
 
-from ..quantized_tensor import Quantizer
+from ..quantized_tensor import Quantizer, QuantizedTensorStorage
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
@@ -75,9 +75,7 @@ def get_tensor_device(tensor: torch.Tensor) -> int:
     QuantizedTensor or Storage incurs more CPU overhead.
     The order of attributes checked is important to also
     minimize overhead.
-    """
-    if hasattr(tensor, "device"):
-        return tensor.device.index
+    """     
     if hasattr(tensor, "_rowwise_data") and tensor._rowwise_data is not None:
         return tensor._rowwise_data.device.index
     if hasattr(tensor, "_columnwise_data") and tensor._columnwise_data is not None:
@@ -86,6 +84,8 @@ def get_tensor_device(tensor: torch.Tensor) -> int:
         return tensor._data.device.index
     if hasattr(tensor, "_transpose") and tensor._transpose is not None:
         return tensor._transpose.device.index
+    if hasattr(tensor, "device"):
+        return tensor.device.index
     return torch.cuda.current_device()
 
 
