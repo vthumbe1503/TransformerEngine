@@ -180,6 +180,9 @@ std::pair<TensorWrapper, py::object> Float8Quantizer::create_tensor(
   } else if (!with_transpose && transpose) {
     transpose.reset();
   }
+  
+  // Set device based on available data
+  at::Device device = with_data ? data->device() : (with_transpose ? transpose->device() : torch::kCUDA);
   py::object transpose_py = with_transpose ? py::cast(*transpose) : py::none();
 
   // Initialize scale-inverse tensor
@@ -199,7 +202,7 @@ std::pair<TensorWrapper, py::object> Float8Quantizer::create_tensor(
     PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
     PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
     PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
-    
+    PyDict_SetItemString(kwargs, "device", py::cast(device).ptr());
     PyObject* result = PyObject_Call(
         reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass),
         PyTuple_New(0),
@@ -221,6 +224,7 @@ std::pair<TensorWrapper, py::object> Float8Quantizer::create_tensor(
     PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
     PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
     PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
+    PyDict_SetItemString(kwargs, "device", py::cast(device).ptr());
     
     PyObject* result = PyObject_Call(
         reinterpret_cast<PyObject*>(Float8TensorPythonClass),
@@ -423,6 +427,7 @@ std::pair<TensorWrapper, py::object> Float8CurrentScalingQuantizer::create_tenso
     const auto opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     scale_inv_tensor = at::empty(scale_inv_shape, opts);
   }
+  at::Device device = with_data ? data_tensor.device() : (with_transpose ? transpose_tensor.device() : torch::kCUDA);
 
   // Construct Python FP8 tensor
   py::object out_py;
@@ -438,7 +443,8 @@ std::pair<TensorWrapper, py::object> Float8CurrentScalingQuantizer::create_tenso
     PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
     PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
     PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
-    
+    PyDict_SetItemString(kwargs, "device", py::cast(device).ptr());
+
     PyObject* result = PyObject_Call(
         reinterpret_cast<PyObject*>(Float8TensorStoragePythonClass),
         PyTuple_New(0),
@@ -460,7 +466,7 @@ std::pair<TensorWrapper, py::object> Float8CurrentScalingQuantizer::create_tenso
     PyDict_SetItemString(kwargs, "fp8_dtype", py::cast(this->dtype).ptr());
     PyDict_SetItemString(kwargs, "data_transpose", transpose_py.ptr());
     PyDict_SetItemString(kwargs, "quantizer", this->quantizer.ptr());
-    
+    PyDict_SetItemString(kwargs, "device", py::cast(device).ptr());
     PyObject* result = PyObject_Call(
         reinterpret_cast<PyObject*>(Float8TensorPythonClass),
         PyTuple_New(0),
