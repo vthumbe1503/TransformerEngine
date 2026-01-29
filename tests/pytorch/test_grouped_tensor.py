@@ -462,6 +462,62 @@ class TestGroupedTensor:
         assert torch.equal(grouped_output.data, expected_data)
         assert torch.equal(grouped_output.scale_inv, expected_scale_inv)
 
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_quantize_grouped_current_scaling(self) -> None:
+        """Test grouped quantization for current scaling against per-tensor quantization."""
+        num_tensors = 3
+        shape = [(256, 128), (128, 64), (64, 256)]
+
+        input_tensors = [
+            torch.randn(s, dtype=torch.bfloat16, device="cuda") for s in shape
+        ]
+
+        grouped_input = GroupedTensor.make_grouped_tensor(
+            num_tensors=num_tensors,
+            shape=shape,
+            quantizers=None,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        offset = 0
+        for tensor in input_tensors:
+            numel = tensor.numel()
+            grouped_input.data[offset : offset + numel].copy_(tensor.reshape(-1))
+            offset += numel
+
+        quantizers = make_quantizers("fp8_current_scaling", num_tensors, shape)
+        grouped_output = GroupedTensor.make_grouped_tensor(
+            num_tensors=num_tensors,
+            shape=shape,
+            quantizers=quantizers,
+            device="cuda",
+        )
+
+        _ = tex.quantize_grouped_current_scaling(grouped_input, grouped_output)
+
+        expected_data = []
+        expected_scale_inv = []
+        expected_scale = []
+        expected_amax = []
+        expected_quantizers = make_quantizers("fp8_current_scaling", num_tensors, shape)
+        for tensor, quantizer in zip(input_tensors, expected_quantizers):
+            qtensor = quantizer(tensor)
+            expected_data.append(qtensor._data.reshape(-1))
+            expected_scale_inv.append(qtensor._scale_inv.reshape(-1))
+            expected_scale.append(quantizer.scale.reshape(-1))
+            expected_amax.append(quantizer.amax.reshape(-1))
+
+        expected_data = torch.cat(expected_data)
+        expected_scale_inv = torch.cat(expected_scale_inv)
+        expected_scale = torch.cat(expected_scale)
+        expected_amax = torch.cat(expected_amax)
+
+        assert torch.equal(grouped_output.data, expected_data)
+        assert torch.equal(grouped_output.scale_inv, expected_scale_inv)
+        assert torch.equal(grouped_output.scale, expected_scale)
+        assert torch.equal(grouped_output.amax, expected_amax)
+
     def test_clear(self) -> None:
         """Test clear method"""
         num_tensors = 3

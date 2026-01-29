@@ -94,6 +94,45 @@ py::object quantize_grouped(const py::handle &input, py::handle& output) {
   return py::reinterpret_borrow<py::object>(output);
 }
 
+py::object quantize_grouped_current_scaling(const py::handle &input, py::handle &output,
+                                            std::optional<at::Tensor> noop_flag) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  const auto &grouped_input_tensor = GroupedTensorFromPyTorchGroupedTensor(input);
+  const auto &grouped_output_tensor = GroupedTensorFromPyTorchGroupedTensor(output);
+
+  // Extract current scaling quantizer settings from output grouped tensor
+  QuantizationConfigWrapper quant_config;
+  py::object quantizer = py::none();
+  if (!output.attr("quantizers").is_none()) {
+    const auto quantizers = output.attr("quantizers").cast<py::list>();
+    if (!quantizers.empty()) {
+      quantizer = quantizers[0];
+    }
+  }
+  NVTE_CHECK(!quantizer.is_none(), "Grouped tensor must have a current scaling quantizer.");
+  NVTE_CHECK(detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr()),
+             "quantize_grouped_current_scaling expects a Float8CurrentScalingQuantizer.");
+
+  quant_config.set_force_pow_2_scales(quantizer.attr("force_pow_2_scales").cast<bool>());
+  quant_config.set_amax_epsilon(quantizer.attr("amax_epsilon").cast<float>());
+
+  std::optional<TensorWrapper> noop_flag_cpp;
+  if (noop_flag.has_value()) {
+    noop_flag_cpp = makeTransformerEngineTensor(*noop_flag);
+    quant_config.set_noop_tensor(noop_flag_cpp->data());
+  }
+
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_quantize_grouped_current_scaling(grouped_input_tensor.data(),
+                                          grouped_output_tensor.data(), quant_config,
+                                          at::cuda::getCurrentCUDAStream());
+  });
+
+  return py::reinterpret_borrow<py::object>(output);
+}
+
 py::object dequantize(const py::handle &input, transformer_engine::DType otype) {
   init_extension();
 
