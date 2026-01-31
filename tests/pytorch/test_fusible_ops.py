@@ -3366,7 +3366,7 @@ class TestSequentialModules:
 
         # Check for expected fusions
         if (
-            te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported()
+            True  # TODO te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported()
             and quantization == "mxfp8"
             and dtype == torch.bfloat16
             and not bias
