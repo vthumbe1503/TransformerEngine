@@ -46,7 +46,12 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
-from transformer_engine.pytorch.cpp_extensions import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.cpp_extensions import (
+    general_gemm,
+    general_grouped_gemm,
+    general_grouped_gemm_for_grouped_tensor,
+)
+from transformer_engine.pytorch.tensor.storage.grouped_tensor import GroupedTensor
 from transformer_engine.common import recipe
 import transformer_engine_torch as tex
 from utils import ModelConfig, reset_rng_states
@@ -1991,6 +1996,62 @@ def test_grouped_linear_accuracy(
             torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
+def test_grouped_linear_single_weight():
+    if tex.get_cublasLt_version() < 130200:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.2+.")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Grouped GEMM requires Blackwell (SM100) or newer.")
+    if not is_bf16_available():
+        pytest.skip("bfloat16 is required for grouped GEMM test.")
+
+    torch.manual_seed(0)
+    num_gemms = 3
+    in_features = 32
+    out_features = 64
+    m_splits = [5, 7, 9]
+    dtype = torch.bfloat16
+
+    reference = GroupedLinear(
+        num_gemms,
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=dtype,
+        device="cuda",
+    ).eval()
+    single_weight = GroupedLinear(
+        num_gemms,
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=dtype,
+        device="cuda",
+        single_weight=True,
+    ).eval()
+
+    with torch.no_grad():
+        ref_weights = [getattr(reference, f"weight{i}") for i in range(num_gemms)]
+        grouped_weights = single_weight.grouped_weight_storage.split_into_quantized_tensors()
+        for i in range(num_gemms):
+            grouped_weights[i].copy_(ref_weights[i])
+
+    inp = torch.randn(sum(m_splits), in_features, device="cuda", dtype=dtype, requires_grad=True)
+    inp_ref = inp.detach().clone().requires_grad_()
+
+    out = single_weight(inp, m_splits)
+    out_ref = reference(inp_ref, m_splits)
+    torch.testing.assert_close(out, out_ref, **dtype_tols(dtype))
+
+    out.sum().backward()
+    out_ref.sum().backward()
+
+    torch.testing.assert_close(inp.grad, inp_ref.grad, **dtype_tols(dtype))
+    ref_wgrad = torch.cat(
+        [getattr(reference, f"weight{i}").grad.view(-1) for i in range(num_gemms)]
+    )
+    torch.testing.assert_close(getattr(single_weight, "weight0").grad, ref_wgrad, **dtype_tols(dtype))
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() != (9, 0),
     reason="Only enable CUTLASS grouped gemm on Hopper",
@@ -2719,10 +2780,15 @@ def test_grouped_gemm(shape, dtype, layout, accumulate, use_cutlass):
     torch.manual_seed(0)
     z, m, k, n = shape
 
-    dist = torch.sort(torch.randint(0, m, (z - 1,))).values.tolist()
-    m_splits = torch.tensor(dist + [m]) - torch.tensor([0] + dist)
-    assert m_splits.sum() == m and len(m_splits) == z
-    m_splits = m_splits.tolist()
+    if z == 1:
+        m_splits = [m]
+    else:
+        split_points = torch.randperm(m - 1)[: z - 1] + 1
+        split_points = torch.sort(split_points).values.tolist()
+        m_splits = [split_points[0]]
+        m_splits += [b - a for a, b in zip(split_points[:-1], split_points[1:])]
+        m_splits.append(m - split_points[-1])
+        assert sum(m_splits) == m and len(m_splits) == z
 
     if layout == "TN":
         A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
@@ -2789,6 +2855,157 @@ def test_grouped_gemm(shape, dtype, layout, accumulate, use_cutlass):
     if use_cutlass:
         os.environ.pop("NVTE_USE_CUTLASS_GROUPED_GEMM", None)
 
+
+def _pack_grouped_tensor(grouped_tensor: GroupedTensor, tensors: List[torch.Tensor]) -> None:
+    offset = 0
+    for tensor in tensors:
+        numel = tensor.numel()
+        grouped_tensor.data[offset : offset + numel].copy_(tensor.reshape(-1))
+        offset += numel
+
+
+def _swap_grouped_tensor_metadata(grouped_tensor: GroupedTensor) -> GroupedTensor:
+    shape = grouped_tensor.shape
+    swapped_shape = [(s[1], s[0]) for s in shape]
+    if grouped_tensor.data is not None:
+        device = grouped_tensor.data.device
+    elif grouped_tensor.columnwise_data is not None:
+        device = grouped_tensor.columnwise_data.device
+    else:
+        raise ValueError("GroupedTensor must have allocated data.")
+
+    first_dims_list = [s[0] for s in swapped_shape]
+    last_dims_list = [s[1] for s in swapped_shape]
+    all_same_first = len(set(first_dims_list)) == 1 if swapped_shape else True
+    all_same_last = len(set(last_dims_list)) == 1 if swapped_shape else True
+    first_dims = (
+        None if all_same_first else torch.tensor(first_dims_list, dtype=torch.int64, device=device)
+    )
+    last_dims = (
+        None if all_same_last else torch.tensor(last_dims_list, dtype=torch.int64, device=device)
+    )
+
+    if all_same_first and all_same_last:
+        logical_shape = (grouped_tensor.num_tensors * first_dims_list[0], last_dims_list[0])
+    elif all_same_first and not all_same_last:
+        logical_shape = (first_dims_list[0], sum(last_dims_list))
+    elif not all_same_first and all_same_last:
+        logical_shape = (sum(first_dims_list), last_dims_list[0])
+    else:
+        total_elements = sum(s[0] * s[1] for s in swapped_shape)
+        logical_shape = (1, total_elements)
+
+    return GroupedTensor(
+        num_tensors=grouped_tensor.num_tensors,
+        shape=swapped_shape,
+        quantizers=grouped_tensor.quantizers,
+        dtype=grouped_tensor.dtype,
+        data=grouped_tensor.data,
+        columnwise_data=grouped_tensor.columnwise_data,
+        scale_inv=grouped_tensor.scale_inv,
+        columnwise_scale_inv=grouped_tensor.columnwise_scale_inv,
+        amax=grouped_tensor.amax,
+        columnwise_amax=grouped_tensor.columnwise_amax,
+        scale=grouped_tensor.scale,
+        first_dims=first_dims,
+        last_dims=last_dims,
+        tensor_offsets=grouped_tensor.tensor_offsets,
+        offsets=grouped_tensor.offsets,
+        scale_inv_offsets=grouped_tensor.scale_inv_offsets,
+        columnwise_scale_inv_offsets=grouped_tensor.columnwise_scale_inv_offsets,
+        logical_shape=logical_shape,
+    )
+
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("accumulate", [False])
+def test_grouped_gemm_grouped_tensor(layout, accumulate):
+    if tex.get_cublasLt_version() < 130200:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.2+.")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Grouped GEMM requires Blackwell (SM100) or newer.")
+    if not is_bf16_available():
+        pytest.skip("bfloat16 is required for grouped GEMM test.")
+
+    torch.manual_seed(0)
+    z, m, k, n = (4, 512, 256, 256)
+
+    split_points = torch.randperm(m - 1)[: z - 1] + 1
+    split_points = torch.sort(split_points).values.tolist()
+    m_sizes = [split_points[0]]
+    m_sizes += [b - a for a, b in zip(split_points[:-1], split_points[1:])]
+    m_sizes.append(m - split_points[-1])
+    assert sum(m_sizes) == m and len(m_sizes) == z
+
+    dtype = torch.bfloat16
+
+    if layout == "TN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        out = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # output
+        grad = False
+
+    elif layout == "NN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # dgrad
+        grad = True
+    else:  # layout == "NT"
+        A = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # wgrad
+        grad = True
+
+    out_ref = [o.clone() for o in out]
+    for i in range(z):
+        general_gemm(
+            A[i],
+            B[i],
+            dtype,
+            grad=grad,
+            accumulate=accumulate,
+            layout=layout,
+            out=out_ref[i],
+        )
+
+    grouped_A = GroupedTensor.make_grouped_tensor(
+        num_tensors=z,
+        shape=[t.shape for t in A],
+        quantizers=None,
+        device="cuda",
+        dtype=dtype,
+    )
+    grouped_B = GroupedTensor.make_grouped_tensor(
+        num_tensors=z,
+        shape=[t.shape for t in B],
+        quantizers=None,
+        device="cuda",
+        dtype=dtype,
+    )
+    grouped_out = GroupedTensor.make_grouped_tensor(
+        num_tensors=z,
+        shape=[t.shape for t in out],
+        quantizers=None,
+        device="cuda",
+        dtype=dtype,
+    )
+    _pack_grouped_tensor(grouped_A, A)
+    _pack_grouped_tensor(grouped_B, B)
+    _pack_grouped_tensor(grouped_out, out)
+
+    general_grouped_gemm_for_grouped_tensor(
+        grouped_A,
+        grouped_B,
+        _swap_grouped_tensor_metadata(grouped_out),
+        layout=layout,
+        accumulate=accumulate,
+    )
+
+    out_grouped = grouped_out.split_into_quantized_tensors()
+    tols = dtype_tols(dtype)
+    for o, o_ref in zip(out_grouped, out_ref):
+        torch.testing.assert_close(o, o_ref, **tols)
 
 @pytest.mark.parametrize("N", [32])
 @pytest.mark.parametrize("datatype", [torch.float16, torch.bfloat16])
