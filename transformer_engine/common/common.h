@@ -333,6 +333,7 @@ struct GroupedTensor {
   NVTEScalingMode scaling_mode;
   size_t num_tensors;
   NVTEGroupedTensor nvte_tensor;
+  bool with_gemm_swizzled_scales = false;
 
   GroupedTensor(NVTEScalingMode scaling_mode, size_t num_tensors)
       : data(),
@@ -348,7 +349,8 @@ struct GroupedTensor {
         tensor_offsets(nullptr, std::vector<size_t>{0}, DType::kInt64),
         logical_shape(nvte_make_shape(nullptr, 1)),
         scaling_mode(scaling_mode),
-        nvte_tensor(0) {}
+        nvte_tensor(0),
+        with_gemm_swizzled_scales(false) {}
 
   explicit operator NVTEGroupedTensor() const noexcept { return nvte_tensor; }
 
@@ -400,6 +402,7 @@ struct GroupedTensor {
     num_tensors = 0;
     scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
     nvte_tensor = 0;
+    with_gemm_swizzled_scales = false;
   }
 };
 
