@@ -101,7 +101,13 @@ inline bool IsFloatingPointType(at::ScalarType type) {
   return type == at::kFloat || type == at::kHalf || type == at::kBFloat16;
 }
 
-constexpr std::array custom_types_converters = {
+using CustomTypesConverter = std::tuple<
+    bool (*)(PyObject *),
+    bool (*)(PyObject *),
+    TensorWrapper (*)(py::handle, Quantizer *),
+    std::unique_ptr<Quantizer> (*)(py::handle)>;
+
+constexpr std::array<CustomTypesConverter, 5> custom_types_converters = {
     std::make_tuple(IsFloat8Tensor, IsFloat8Quantizers, NVTETensorFromFloat8Tensor,
                     CreateQuantizer<Float8Quantizer>),
     std::make_tuple(IsFloat8Tensor, IsFloat8CurrentScalingQuantizers, NVTETensorFromFloat8Tensor,

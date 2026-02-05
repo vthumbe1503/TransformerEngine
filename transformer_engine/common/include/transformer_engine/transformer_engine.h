@@ -1114,6 +1114,83 @@ class GroupedTensorWrapper {
     return get_parameter(kNVTEGroupedTensorOffsets);
   }
 
+  /*! \brief Create a view with swapped metadata for cuBLAS column-major output.
+   *
+   * This swaps first/last dimension metadata and adjusts logical_shape so that
+   * row-major storage is interpreted correctly by column-major GEMM.
+   */
+  GroupedTensorWrapper make_cublas_col_major_view() const {
+    const auto num_tensors = this->num_tensors();
+    const auto first_dims = get_first_dims();
+    const auto last_dims = get_last_dims();
+    const bool has_first = first_dims.data_ptr != nullptr;
+    const bool has_last = last_dims.data_ptr != nullptr;
+    const auto logical_shape = this->logical_shape();
+
+    std::vector<size_t> swapped_logical_shape = {logical_shape.data[0], logical_shape.data[1]};
+    if (!has_first && !has_last) {
+      const size_t common_first = logical_shape.data[0] / num_tensors;
+      const size_t common_last = logical_shape.data[1];
+      swapped_logical_shape = {num_tensors * common_last, common_first};
+    } else if (!has_first || !has_last) {
+      swapped_logical_shape = {logical_shape.data[1], logical_shape.data[0]};
+    }
+
+    GroupedTensorWrapper swapped(num_tensors, swapped_logical_shape, scaling_mode());
+
+    const auto rowwise_data = get_rowwise_data();
+    if (rowwise_data.data_ptr != nullptr) {
+      swapped.set_rowwise_data(rowwise_data.data_ptr, static_cast<DType>(rowwise_data.dtype),
+                               rowwise_data.shape);
+    }
+    const auto colwise_data = get_columnwise_data();
+    if (colwise_data.data_ptr != nullptr) {
+      swapped.set_columnwise_data(colwise_data.data_ptr, static_cast<DType>(colwise_data.dtype),
+                                  colwise_data.shape);
+    }
+    const auto scale = get_scale();
+    if (scale.data_ptr != nullptr) {
+      swapped.set_scale(scale.data_ptr, static_cast<DType>(scale.dtype), scale.shape);
+    }
+    const auto amax = get_amax();
+    if (amax.data_ptr != nullptr) {
+      swapped.set_amax(amax.data_ptr, static_cast<DType>(amax.dtype), amax.shape);
+    }
+    const auto colwise_amax = get_columnwise_amax();
+    if (colwise_amax.data_ptr != nullptr) {
+      swapped.set_columnwise_amax(colwise_amax.data_ptr, static_cast<DType>(colwise_amax.dtype),
+                                  colwise_amax.shape);
+    }
+    const auto scale_inv = get_rowwise_scale_inv();
+    if (scale_inv.data_ptr != nullptr) {
+      swapped.set_rowwise_scale_inv(scale_inv.data_ptr, static_cast<DType>(scale_inv.dtype),
+                                    scale_inv.shape);
+    }
+    const auto colwise_scale_inv = get_columnwise_scale_inv();
+    if (colwise_scale_inv.data_ptr != nullptr) {
+      swapped.set_columnwise_scale_inv(colwise_scale_inv.data_ptr,
+                                       static_cast<DType>(colwise_scale_inv.dtype),
+                                       colwise_scale_inv.shape);
+    }
+
+    if (last_dims.data_ptr != nullptr) {
+      swapped.set_first_dims(last_dims.data_ptr, static_cast<DType>(last_dims.dtype),
+                             last_dims.shape);
+    }
+    if (first_dims.data_ptr != nullptr) {
+      swapped.set_last_dims(first_dims.data_ptr, static_cast<DType>(first_dims.dtype),
+                            first_dims.shape);
+    }
+
+    const auto tensor_offsets = get_tensor_offsets();
+    if (tensor_offsets.data_ptr != nullptr) {
+      swapped.set_tensor_offsets(tensor_offsets.data_ptr, static_cast<DType>(tensor_offsets.dtype),
+                                 tensor_offsets.shape);
+    }
+
+    return swapped;
+  }
+
   /*! \brief Get an underlying NVTEGroupedTensor.
    *
    *  \return NVTEGroupedTensor held by this GroupedTensorWrapper.

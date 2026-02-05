@@ -592,6 +592,12 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
     grouped_C = GroupedTensorFromPyTorchGroupedTensor(C);
   }
 
+  auto grouped_D_cublas_col_major = grouped_D.make_cublas_col_major_view();
+  std::optional<GroupedTensorWrapper> grouped_C_cublas_col_major = std::nullopt;
+  if (grouped_C.has_value()) {
+    grouped_C_cublas_col_major = grouped_C->make_cublas_col_major_view();
+  }
+  
   const size_t num_tensors = grouped_A.num_tensors();
   NVTE_CHECK(num_tensors > 0, "Grouped GEMM requires non-empty inputs.");
   NVTE_CHECK(grouped_B.num_tensors() == num_tensors,
@@ -626,9 +632,11 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
 
   NVTE_SCOPED_GIL_RELEASE({
     nvte_grouped_gemm(grouped_A.data(), transa, grouped_B.data(), transb,
-                      grouped_C.has_value() ? grouped_C->data() : nullptr, grouped_D.data(),
-                      te_alpha.data(), te_beta.data(), te_workspace_setup.data(),
-                      te_workspace_cublas.data(),
+                      grouped_C_cublas_col_major.has_value()
+                          ? grouped_C_cublas_col_major->data()
+                          : nullptr,
+                      grouped_D_cublas_col_major.data(), te_alpha.data(), te_beta.data(),
+                      te_workspace_setup.data(), te_workspace_cublas.data(),
                       config.has_value() ? static_cast<NVTEGroupedMatmulConfig>(*config) : nullptr,
                       at::cuda::getCurrentCUDAStream());
   });

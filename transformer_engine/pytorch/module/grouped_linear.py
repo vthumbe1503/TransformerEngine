@@ -100,63 +100,6 @@ def _make_grouped_tensor_for_m_splits(
     return grouped
 
 
-def _swap_grouped_tensor_metadata(grouped_tensor: GroupedTensor) -> GroupedTensor:
-    shape = grouped_tensor.shape
-    swapped_shape = [(s[1], s[0]) for s in shape]
-    if grouped_tensor.data is not None:
-        device = grouped_tensor.data.device
-    elif grouped_tensor.columnwise_data is not None:
-        device = grouped_tensor.columnwise_data.device
-    else:
-        raise ValueError("GroupedTensor must have allocated data.")
-
-    first_dims_list = [s[0] for s in swapped_shape]
-    last_dims_list = [s[1] for s in swapped_shape]
-    all_same_first = len(set(first_dims_list)) == 1 if swapped_shape else True
-    all_same_last = len(set(last_dims_list)) == 1 if swapped_shape else True
-    first_dims = (
-        None
-        if all_same_first
-        else torch.tensor(first_dims_list, dtype=torch.int64, device=device)
-    )
-    last_dims = (
-        None
-        if all_same_last
-        else torch.tensor(last_dims_list, dtype=torch.int64, device=device)
-    )
-
-    if all_same_first and all_same_last:
-        logical_shape = (grouped_tensor.num_tensors * first_dims_list[0], last_dims_list[0])
-    elif all_same_first and not all_same_last:
-        logical_shape = (first_dims_list[0], sum(last_dims_list))
-    elif not all_same_first and all_same_last:
-        logical_shape = (sum(first_dims_list), last_dims_list[0])
-    else:
-        total_elements = sum(s[0] * s[1] for s in swapped_shape)
-        logical_shape = (1, total_elements)
-
-    return GroupedTensor(
-        num_tensors=grouped_tensor.num_tensors,
-        shape=swapped_shape,
-        quantizers=grouped_tensor.quantizers,
-        dtype=grouped_tensor.dtype,
-        data=grouped_tensor.data,
-        columnwise_data=grouped_tensor.columnwise_data,
-        scale_inv=grouped_tensor.scale_inv,
-        columnwise_scale_inv=grouped_tensor.columnwise_scale_inv,
-        amax=grouped_tensor.amax,
-        columnwise_amax=grouped_tensor.columnwise_amax,
-        scale=grouped_tensor.scale,
-        first_dims=first_dims,
-        last_dims=last_dims,
-        tensor_offsets=grouped_tensor.tensor_offsets,
-        offsets=grouped_tensor.offsets,
-        scale_inv_offsets=grouped_tensor.scale_inv_offsets,
-        columnwise_scale_inv_offsets=grouped_tensor.columnwise_scale_inv_offsets,
-        logical_shape=logical_shape,
-    )
-
-
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
     Calls custom cuda extensions.
@@ -331,7 +274,7 @@ class _GroupedLinear(torch.autograd.Function):
             general_grouped_gemm_for_grouped_tensor(
                 grouped_weight,
                 grouped_input,
-                _swap_grouped_tensor_metadata(grouped_out),
+                grouped_out,
                 layout="TN",
                 accumulate=False,
             )
@@ -574,7 +517,7 @@ class _GroupedLinear(torch.autograd.Function):
                     general_grouped_gemm_for_grouped_tensor(
                         grouped_weight,
                         grouped_grad_output,
-                        _swap_grouped_tensor_metadata(grouped_dgrad),
+                        grouped_dgrad,
                         layout="NN",
                         accumulate=False,
                     )
@@ -664,7 +607,7 @@ class _GroupedLinear(torch.autograd.Function):
                         general_grouped_gemm_for_grouped_tensor(
                             grouped_input,
                             grouped_grad_output,
-                            _swap_grouped_tensor_metadata(grouped_wgrad),
+                            grouped_wgrad,
                             layout="NT",
                             accumulate=accumulate_wgrad,
                         )

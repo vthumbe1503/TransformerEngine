@@ -335,7 +335,8 @@ def general_grouped_gemm_for_grouped_tensor(
     This uses nvte_grouped_gemm and supports different per-matrix shapes.
 
     The caller must ensure that GroupedTensor metadata is already compatible with the
-    underlying GEMM implementation (e.g., aligned offsets and output metadata layout).
+    underlying GEMM implementation (e.g., aligned offsets). Output GroupedTensor metadata
+    is treated as row-major by default.
     """
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
