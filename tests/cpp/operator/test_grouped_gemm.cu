@@ -175,8 +175,8 @@ std::vector<std::tuple<size_t, size_t, size_t>> make_shapes(ShapeCase scase) {
 }
 
 void run_grouped_gemm_case(const TestParams& params) {
-#if CUBLAS_VERSION < 130100
-  GTEST_SKIP() << "Grouped GEMM requires cuBLAS 13.1+, but compile-time cuBLAS version is "
+#if CUBLAS_VERSION < 130200
+  GTEST_SKIP() << "Grouped GEMM requires cuBLAS 13.2+, but compile-time cuBLAS version is "
                << CUBLAS_VERSION << ".";
 #else
   if (getDeviceComputeCapability() < blackwellComputeCapability) {
@@ -349,7 +349,7 @@ void run_grouped_gemm_case(const TestParams& params) {
                    atol,
                    rtol);
   }
-#endif  // CUBLAS_VERSION >= 130100
+#endif  // CUBLAS_VERSION >= 130200
 }
 
 class GroupedGemmTest : public ::testing::TestWithParam<TestParams> {};
