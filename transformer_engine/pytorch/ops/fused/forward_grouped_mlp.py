@@ -14,6 +14,7 @@ import torch
 
 import transformer_engine_torch as tex
 from ...cpp_extensions import general_grouped_gemm
+from ...module._common import noop_cat
 from ...quantization import Recipe
 from ...tensor import MXFP8Tensor, Quantizer
 from ...utils import get_device_compute_capability
@@ -87,7 +88,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         if swiglu.glu_interleave_size != 32:
             raise ValueError(
                 "Fused kernel requires 32-wide GLU interleaving, "
-                "but got glu_interleave_size={swiglu.glu_interleave_size}."
+                f"but got glu_interleave_size={swiglu.glu_interleave_size}."
             )
 
     def fuser_forward(
@@ -164,23 +165,17 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         # Extract post-scales from extra input
         scales = basic_op_extra_inputs[1][0]
 
-        # Extract params
-        fc1_weights = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
-        fc2_weights = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
-
-        # Convert weight dtype if needed
-        fc1_ws = []
-        fc2_ws = []
-        for w, quantizer in zip(fc1_weights, fc1_weight_quantizers):
-            if not is_quantized_tensor(w):
+        # Extract params and quantize to MXFP8 if needed
+        fc1_ws = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
+        fc2_ws = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+        if not is_quantized_tensor(fc1_ws[0]):
+            for quantizer in fc1_weight_quantizers:
                 quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                w = quantizer(w)
-            fc1_ws.append(w)
-        for w, quantizer in zip(fc2_weights, fc2_weight_quantizers):
-            if not is_quantized_tensor(w):
+            fc1_ws = fc1_op._quantize_weights_mxfp8(fc1_ws, fc1_weight_quantizers)
+        if not is_quantized_tensor(fc2_ws[0]):
+            for quantizer in fc2_weight_quantizers:
                 quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                w = quantizer(w)
-            fc2_ws.append(w)
+            fc2_ws = fc2_op._quantize_weights_mxfp8(fc2_ws, fc2_weight_quantizers)
 
         # Split input tensor and convert dtypes if needed
         fc1_x = maybe_dequantize(input_, dtype)
@@ -191,10 +186,18 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc1_xs = tex.split_quantize(fc1_x, split_sizes_cpu, fc1_input_quantizers)
 
         # Pack data tensors
-        fc1_x_data = torch.cat([x._rowwise_data for x in fc1_xs])
+        # Note: Fused kernel expects tensor with non-contiguous
+        # logical dims.
+        # Data actual shape: (1, sum(m), k)
+        # Scale actual shape: (1, sum(m)/128, k/128, 32 (block row),
+        #  4 (block row), 4 (block col))
+        # Data logical shape: (sum(m), k, 1)
+        # Scale logical shape: (32 (block row), 4 (block row),
+        #   sum(m)/128, 4 (block col), k/128, 1)
+        fc1_x_data = noop_cat([x._rowwise_data for x in fc1_xs])
         fc1_x_data = fc1_x_data.view(dtype=torch.float8_e4m3fn)
         fc1_x_data = fc1_x_data.unsqueeze(0).permute(1, 2, 0)
-        fc1_x_scales = torch.cat([x._rowwise_scale_inv for x in fc1_xs])
+        fc1_x_scales = noop_cat([x._rowwise_scale_inv for x in fc1_xs])
         fc1_x_scales = fc1_x_scales.view(dtype=torch.float8_e8m0fnu)
         fc1_x_scales = fc1_x_scales.view(
             1,
@@ -207,7 +210,15 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc1_x_scales = fc1_x_scales.permute(3, 4, 1, 5, 2, 0)
 
         # Pack weight tensors
-        fc1_w_data = torch.stack([w._rowwise_data for w in fc1_weights])
+        # Note: Fused kernel expects tensor with non-contiguous
+        # logical dims.
+        # Data actual shape: (num_groups, n, k)
+        # Scale actual shape: (num_groups, n/128, k/128, 32 (block row),
+        #  4 (block row), 4 (block col))
+        # Data logical shape: (n, k, num_groups)
+        # Scale logical shape: (32 (block row), 4 (block row), n/128,
+        #   4 (block col), k/128, num_groups)
+        fc1_w_data = noop_cat([w._rowwise_data for w in fc1_ws])
         fc1_w_data = fc1_w_data.view(dtype=torch.float8_e4m3fn)
         fc1_w_data = fc1_w_data.view(
             num_groups, fc1_weight_shape[0] // 64, 2, 32, fc1_weight_shape[1]
@@ -215,7 +226,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc1_w_data = fc1_w_data.flip(2).contiguous()  # Swap SwiGLU gate/activation
         fc1_w_data = fc1_w_data.view(num_groups, fc1_weight_shape[0], fc1_weight_shape[1])
         fc1_w_data = fc1_w_data.permute(1, 2, 0)
-        fc1_w_scales = torch.stack([w._rowwise_scale_inv for w in fc1_weights])
+        fc1_w_scales = noop_cat([w._rowwise_scale_inv for w in fc1_ws])
         fc1_w_scales = fc1_w_scales.view(dtype=torch.float8_e8m0fnu)
         fc1_w_scales = fc1_w_scales.view(
             num_groups, fc1_weight_shape[0] // 64, 2, 32, fc1_weight_shape[1] // 32
@@ -223,7 +234,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc1_w_scales = fc1_w_scales.flip(2).contiguous()  # Swap SwiGLU gate/activation
         fc1_w_scales = fc1_w_scales.view(
             num_groups, fc1_weight_shape[0] // 128, 4, 32, fc1_weight_shape[1] // 128, 4
-        )
+        )  # Unswizzled layout
         fc1_w_scales = fc1_w_scales.permute(
             0, 1, 4, 3, 2, 5
         ).contiguous()  # Convert to swizzled layout
@@ -273,6 +284,14 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         )
 
         # Unpack kernel outputs
+        # Note: Fused kernel outputs tensors with non-contiguous
+        # logical dims.
+        # Row-wise data logical shape: (sum(m), k, 1)
+        # Row-wise scale logical shape: (32 (block row), 4 (block row),
+        #   sum(m)/128, 4 (block col), k/128, 1)
+        # Column-wise data logical shape: (sum(m), k, 1)
+        # Column-wise scale logical shape: (32 (block col), 4 (block col),
+        #   k/128, 4 (block row), sum(m)/128, 1)
         swiglu_in = fc1_kernel_out["c_tensor"]
         swiglu_in = swiglu_in.permute(2, 0, 1)
         swiglu_in = swiglu_in.view(in_shape[0], fc1_weight_shape[0] // 64, 2, 32)
