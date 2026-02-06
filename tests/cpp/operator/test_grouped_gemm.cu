@@ -10,7 +10,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <iostream>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -161,16 +160,16 @@ struct TestParams {
 std::vector<std::tuple<size_t, size_t, size_t>> make_shapes(ShapeCase scase) {
   switch (scase) {
     case ShapeCase::kAllSame:
-      return {{128, 128, 128}, {128, 128, 128}, {128, 128, 128}};
+      return {{128, 256, 384}, {128, 256, 384}, {128, 256, 384}};
     case ShapeCase::kSameFirst:
       // Same M (first dim), varying N and K
-      return {{128, 256, 128}, {128, 384, 256}, {128, 512, 384}};
+      return {{128, 256, 384}, {128, 384, 512}, {128, 512, 640}};
     case ShapeCase::kSameLast:
       // Same N (last dim), varying M and K
-      return {{128, 256, 128}, {256, 256, 256}, {384, 256, 384}};
+      return {{128, 256, 384}, {256, 256, 512}, {384, 256, 640}};
     case ShapeCase::kAllDifferent:
     default:
-      return {{128, 256, 128}, {256, 384, 256}, {384, 512, 384}};
+      return {{128, 256, 384}, {256, 384, 512}, {384, 512, 640}};
   }
 }
 
@@ -196,10 +195,10 @@ void run_grouped_gemm_case(const TestParams& params) {
 
   for (size_t i = 0; i < num_gemms; ++i) {
     const auto [M, N, K] = shapes[i];
-    const std::vector<size_t> a_shape = params.transa ? std::vector<size_t>{M, K}
-                                                      : std::vector<size_t>{K, M};
-    const std::vector<size_t> b_shape = params.transb ? std::vector<size_t>{K, N}
-                                                      : std::vector<size_t>{N, K};
+    const std::vector<size_t> a_shape = params.transa ? std::vector<size_t>{N, K}
+                                                      : std::vector<size_t>{K, N};
+    const std::vector<size_t> b_shape = params.transb ? std::vector<size_t>{K, M}
+                                                      : std::vector<size_t>{M, K};
     switch (params.input_case) {
       case InputCase::kFP8Current: {
         A_tensors.emplace_back(make_fp8_operand("A" + std::to_string(i), a_shape));
@@ -383,7 +382,14 @@ const std::vector<TestParams> kTestParams = {
     {InputCase::kBF16, false, false, ShapeCase::kAllSame, true},
     // MXFP8 tests
     {InputCase::kMXFP8, true, false, ShapeCase::kAllSame, false},
+    {InputCase::kMXFP8, true, false, ShapeCase::kAllDifferent, false},
+    {InputCase::kMXFP8, false, true, ShapeCase::kAllSame, false},
     {InputCase::kMXFP8, false, true, ShapeCase::kAllDifferent, false},
+    {InputCase::kMXFP8, false, false, ShapeCase::kAllSame, false},
+    {InputCase::kMXFP8, false, false, ShapeCase::kAllDifferent, false},
+    {InputCase::kMXFP8, false, false, ShapeCase::kSameFirst, false},
+    // MXFP8 with NULL C
+    {InputCase::kMXFP8, true, false, ShapeCase::kAllSame, true},
 };
 
 INSTANTIATE_TEST_SUITE_P(OperatorTest,

@@ -11,6 +11,7 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <cstdint>
+#include <vector>
 
 #include "../common.h"
 #include "../util/cuda_runtime.h"
@@ -339,12 +340,20 @@ inline GroupedOperandSelection select_grouped_operand(const transformer_engine::
         use_rowwise();
       } else {
         NVTE_CHECK(has_col, "Grouped GEMM: MXFP8 non-transposed A is missing column-wise data");
-        use_columnwise();
+        // Use columnwise data/scales but keep dims un-swapped and trans unchanged.
+        sel.dptr = static_cast<char *>(t->columnwise_data.dptr);
+        sel.scale_inv = t->columnwise_scale_inv.dptr;
+        sel.dtype = col_dtype;
+        sel.shape = create_shape_info(t, /*swap_dims=*/false);
       }
     } else {  // B
       if (trans) {
         NVTE_CHECK(has_col, "Grouped GEMM: MXFP8 transposed B is missing column-wise data");
-        use_columnwise();
+        // Use columnwise data/scales but keep dims un-swapped and trans unchanged.
+        sel.dptr = static_cast<char *>(t->columnwise_data.dptr);
+        sel.scale_inv = t->columnwise_scale_inv.dptr;
+        sel.dtype = col_dtype;
+        sel.shape = create_shape_info(t, /*swap_dims=*/false);
       } else {
         NVTE_CHECK(has_row, "Grouped GEMM: MXFP8 non-transposed B is missing row-wise data");
         use_rowwise();
@@ -536,18 +545,6 @@ inline cublasLtMatmulAlgo_t select_grouped_gemm_algo(cublasLtHandle_t handle,
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       &preference, CUBLASLT_MATMUL_PREF_GROUPED_AVERAGE_REDUCTION_DIM, &avg_k, sizeof(int64_t)));
 
-  // Set minimum alignment hints for grouped GEMM
-  // For batched pointers, each matrix may have different alignment, so use conservative value
-  uint32_t min_alignment = 16;  // 16 bytes is safe for FP8 (128-bit aligned)
-  NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &min_alignment, sizeof(min_alignment)));
-  NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &min_alignment, sizeof(min_alignment)));
-  NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &min_alignment, sizeof(min_alignment)));
-  NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &min_alignment, sizeof(min_alignment)));
-
   cublasLtMatmulHeuristicResult_t heuristicResult;
   int returnedResults = 0;
   auto status = cublasLtMatmulAlgoGetHeuristic(handle, &matmulDesc, &descA, &descB, &descC, &descD,
@@ -610,9 +607,8 @@ __global__ void setup_grouped_gemm_kernel(
   a_cols[idx] = static_cast<int>(a_first);
   b_rows[idx] = static_cast<int>(b_last);
   b_cols[idx] = static_cast<int>(b_first);
-  // For OUTPUTS (D, C): cuBLAS writes in column-major, so rows=first (M), cols=last (N).
-  d_rows[idx] = static_cast<int>(d_first);
-  d_cols[idx] = static_cast<int>(d_last);
+  d_rows[idx] = static_cast<int>(d_last);
+  d_cols[idx] = static_cast<int>(d_first);
 
   // Fill alpha/beta pointers (per-matrix)
   alpha_ptrs[idx] = alpha_ptr + idx;

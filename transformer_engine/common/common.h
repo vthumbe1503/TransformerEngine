@@ -333,8 +333,6 @@ struct GroupedTensor {
   NVTEScalingMode scaling_mode;
   size_t num_tensors;
   NVTEGroupedTensor nvte_tensor;
-  bool with_gemm_swizzled_scales = false;
-
   /*! \brief Whether scaling factors are in format expected by GEMM
    *
    *  Only meaningful for MXFP8 and NVFP4.
