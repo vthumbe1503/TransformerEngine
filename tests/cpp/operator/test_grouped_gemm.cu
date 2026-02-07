@@ -140,7 +140,7 @@ void run_grouped_gemm_case(const TestParams& params) {
       }
     }
     D_multi.emplace_back(Tensor("D_multi" + std::to_string(i),
-                                std::vector<size_t>{M, N},
+                                std::vector<size_t>{N, M},
                                 DType::kBFloat16));
   }
 
@@ -197,11 +197,11 @@ void run_grouped_gemm_case(const TestParams& params) {
     (void)K;
     if (!params.use_null_c) {
       C_tensors.emplace_back(Tensor("C" + std::to_string(i),
-                                    std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)},
+                                    std::vector<size_t>{static_cast<size_t>(N), static_cast<size_t>(M)},
                                     DType::kBFloat16));
     }
     D_group_tensors.emplace_back(Tensor("D_group" + std::to_string(i),
-                                        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)},
+                                        std::vector<size_t>{static_cast<size_t>(N), static_cast<size_t>(M)},
                                         DType::kBFloat16));
     NVTE_CHECK_CUDA(cudaMemset(D_group_tensors.back().rowwise_dptr(), 0, bytes(D_group_tensors.back().rowwise_shape(), D_group_tensors.back().dtype())));
   }

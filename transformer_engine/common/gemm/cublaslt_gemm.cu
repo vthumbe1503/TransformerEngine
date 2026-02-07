@@ -320,6 +320,12 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   const int B0 = inputB->flat_first_dim();
   const int B1 = inputB->flat_last_dim();
 
+  //A --> (A0, A1)
+  //B --> (B0, B1)
+
+  // T -->(A1, A0)
+  // N --> (B0, B1)
+  
   // GEMM dims in column-major order
   const int m = transa == CUBLAS_OP_T ? A0 : A1;
   const int n = transb == CUBLAS_OP_T ? B1 : B0;

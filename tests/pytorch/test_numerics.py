@@ -2905,16 +2905,18 @@ def test_grouped_gemm_grouped_tensor(layout, accumulate):
         grad = True
 
     out_ref = [o.clone() for o in out]
-    for i in range(z):
-        general_gemm(
-            A[i],
-            B[i],
-            dtype,
-            grad=grad,
-            accumulate=accumulate,
-            layout=layout,
-            out=out_ref[i],
-        )
+    general_grouped_gemm(
+        A,
+        B,
+        out_ref,
+        [None] * z,
+        dtype,
+        m_splits=m_sizes,
+        grad=grad,
+        accumulate=accumulate,
+        layout=layout,
+        single_output=False,
+    )
 
     grouped_A = GroupedTensor.make_grouped_tensor(
         num_tensors=z,
