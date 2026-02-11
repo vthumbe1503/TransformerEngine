@@ -52,7 +52,7 @@ class GroupedTensor:
     def __init__(
         self,
         num_tensors: int,
-        shape: List[Tuple[int, int]],
+        shape: Optional[List[Tuple[int, int]]] = None,
         quantizer: Optional[Quantizer] = None,
         dtype: Optional[torch.dtype] = None,
         data: Optional[torch.Tensor] = None,
@@ -245,6 +245,7 @@ class GroupedTensor:
         """
         Reset tensor data and clear all buffers.
         """
+        self.shape = None
         self.data = None
         self.columnwise_data = None
         self.scale_inv = None
@@ -622,6 +623,8 @@ class GroupedTensor:
         result = []
 
         no_quantization = self.quantizer is None
+
+        assert self.shape is not None, "Shape must be set for splitting a GroupedTensor."
 
         # Case 1: No quantization - return regular torch tensors
         if no_quantization:
