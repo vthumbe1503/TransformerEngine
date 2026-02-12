@@ -845,8 +845,6 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
     NVTE_CHECK(scales_colwise_ptr != nullptr, "Columnwise scaling tensor must be allocated");
   }
 
-  const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
-
   const size_t dbias_rows = DIVUP(first_logical_dim, CHUNK_DIM_Y);
   const size_t dbias_cols = last_logical_dim;
   if constexpr (IS_DBIAS) {
