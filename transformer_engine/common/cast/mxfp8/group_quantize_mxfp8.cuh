@@ -980,7 +980,7 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
 
               NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
       );                                              // NOLINT(*)
-  ;                                                  // NOLINT(*)
+  );                                                  // NOLINT(*)
 }
 
 }  // namespace mxfp8
