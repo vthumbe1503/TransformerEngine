@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Fusible operation for bias."""
+"""Fusible operation for grouped linear layer."""
 
 from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
@@ -36,6 +36,8 @@ from ..op import BasicOperation, OperationContext
 
 class GroupedLinear(BasicOperation):
     r"""Apply multiple linear transformations: :math:``y_i = x_i W_i^T + b_i``
+
+    This feature is experimental and subject to change.
 
     This is equivalent to splitting the input tensor along its first
     dimension, applying a separate ``torch.nn.Linear`` to each split,
@@ -305,7 +307,7 @@ class GroupedLinear(BasicOperation):
                 weight = MXFP8Tensor(
                     shape=unpacked_shape,
                     dtype=dtype,
-                    fp8_dtype=dtype,
+                    fp8_dtype=tex.DType.kFloat8E4M3,
                     rowwise_data=rowwise_data[group_idx],
                     rowwise_scale_inv=rowwise_scales[group_idx],
                     columnwise_data=columnwise_data[group_idx],
