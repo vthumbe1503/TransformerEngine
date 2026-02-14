@@ -15,6 +15,9 @@ from ..quantization import FP8GlobalStateManager
 from ..tensor.float8_tensor import Float8Tensor
 from ..quantized_tensor import QuantizedTensorStorage
 from ..utils import canonicalize_dtype
+from ..module._common import noop_cat
+from ..tensor import Quantizer
+from ..tensor.storage.grouped_tensor import GroupedTensor
 
 
 def is_quantized_tensor(tensor: torch.Tensor | QuantizedTensorStorage) -> bool:
@@ -71,3 +74,128 @@ def get_fp8_meta_from_fp8_tensor(tensor: Float8Tensor) -> tuple[FP8TensorMeta, i
     fp8_meta.amax_history = torch.empty(1, 1, dtype=torch.float32, device=tensor.device)
     fp8_meta.scale_inv = tensor._scale_inv
     return fp8_meta, 0
+
+
+
+def make_grouped_tensor_from_buffers(
+    *,
+    num_groups: int,
+    data: torch.Tensor,
+    columnwise_data: torch.Tensor,
+    scale_inv: torch.Tensor,
+    columnwise_scale_inv: torch.Tensor,
+    split_sizes: torch.Tensor,
+    logical_last_dim: int,
+    dtype: torch.dtype,
+    quantizer: Quantizer,
+) -> GroupedTensor:
+    """Build GroupedTensor from FC1+SwiGLU / dSwiGLU kernel outputs.
+
+    Scales are already in GEMM swizzled layout.
+    """
+    return GroupedTensor(
+        num_tensors=num_groups,
+        shape=None,
+        quantizer=quantizer,
+        dtype=dtype,
+        data=data,
+        columnwise_data=columnwise_data,
+        scale_inv=scale_inv,
+        columnwise_scale_inv=columnwise_scale_inv,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=split_sizes,
+        last_dims=None,
+        tensor_offsets=GroupedTensor.make_tensor_offsets(split_sizes, logical_last_dim),
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        logical_shape=(data.shape[0], logical_last_dim),
+    )
+
+
+def make_grouped_tensor_from_mxfp8_weights(
+    weights: list,
+    quantizer: Quantizer,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> GroupedTensor:
+    """Build a GroupedTensor from MXFP8 weight tensors by packing their buffers (no copy when contiguous).
+    """
+    num_groups = len(weights)
+    weight_shape = weights[0].shape
+    O, I = weight_shape[0], weight_shape[1]
+    logical_first_dim = num_groups * O
+    logical_last_dim = I
+    shape = [weight_shape] * num_groups
+
+    tensor_offsets = torch.arange(
+        num_groups + 1, dtype=torch.int64, device=device
+    ) * (O * I)
+    offsets = tensor_offsets.tolist()
+    data = None
+    scale_inv = None
+    scale_inv_offsets = None
+    columnwise_data = None
+    columnwise_scale_inv = None
+    columnwise_scale_inv_offsets = None
+
+    # Pack rowwise into data/scale_inv when available.
+    if weights[0]._rowwise_data is not None:
+        data = noop_cat([w._rowwise_data.reshape(-1) for w in weights])
+        scale_inv_list = [w._rowwise_scale_inv.reshape(-1) for w in weights]
+        scale_inv = noop_cat(scale_inv_list)
+    # Pack columnwise into columnwise_* when available.
+    if weights[0]._columnwise_data is not None:
+        columnwise_data = noop_cat([w._columnwise_data.reshape(-1) for w in weights])
+        col_scale_list = [w._columnwise_scale_inv.reshape(-1) for w in weights]
+        columnwise_scale_inv = noop_cat(col_scale_list)
+
+    return GroupedTensor(
+        num_tensors=num_groups,
+        shape=shape,
+        quantizer=quantizer,
+        dtype=dtype,
+        data=data,
+        columnwise_data=columnwise_data,
+        scale_inv=scale_inv,
+        columnwise_scale_inv=columnwise_scale_inv,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=None,
+        last_dims=None,
+        tensor_offsets=tensor_offsets,
+        offsets=offsets,
+        scale_inv_offsets=scale_inv_offsets,
+        columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+        logical_shape=(logical_first_dim, logical_last_dim),
+    )
+
+
+def make_grouped_output(
+    data: torch.Tensor,
+    split_sizes: torch.Tensor,
+) -> GroupedTensor:
+    """Build a GroupedTensor wrapping a contiguous output buffer with given split sizes for rowwise usage."""
+    return GroupedTensor(
+        num_tensors=int(split_sizes.numel()),
+        shape=None,
+        quantizer=None,
+        dtype=data.dtype,
+        data=data,
+        columnwise_data=None,
+        scale_inv=None,
+        columnwise_scale_inv=None,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=split_sizes,
+        last_dims=None,
+        tensor_offsets=GroupedTensor.make_tensor_offsets(split_sizes, data.shape[-1]),
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        logical_shape=(data.shape[0], data.shape[-1]),
+    )

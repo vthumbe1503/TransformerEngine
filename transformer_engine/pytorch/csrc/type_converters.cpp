@@ -282,6 +282,15 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
                            getTensorShape(tensor_offsets));
   }
 
+
+    bool with_gemm_swizzled = false;
+    if (!quantizer.is_none()) {
+      with_gemm_swizzled =
+          py::hasattr(quantizer, "optimize_for_gemm") && quantizer.attr("optimize_for_gemm").cast<bool>();
+    }
+    nvte_set_grouped_tensor_swizzled_scales(ret.data(),
+                                           static_cast<uint8_t>(with_gemm_swizzled));
+
   return ret;
 }
 

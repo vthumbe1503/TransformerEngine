@@ -1263,6 +1263,8 @@ std::pair<GroupedTensorWrapper, py::object> MXFP8Quantizer::create_grouped_tenso
     columnwise_scale_inv = at::empty({total_scale_elements}, uint8_opts);
   }
 
+  const bool with_gemm_swizzled_scales = this->optimize_for_gemm;
+
   GroupedTensorWrapper out_cpp(num_tensors, logical_shape, this->get_scaling_mode());
   if (rowwise_usage) {
     out_cpp.set_rowwise_data(rowwise_data->data_ptr(), this->dtype, getTensorShape(*rowwise_data));
@@ -1282,6 +1284,8 @@ std::pair<GroupedTensorWrapper, py::object> MXFP8Quantizer::create_grouped_tenso
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                getTensorShape(*tensor_offsets));
   }
+  nvte_set_grouped_tensor_swizzled_scales(out_cpp.data(),
+                                          static_cast<uint8_t>(with_gemm_swizzled_scales));
 
   py::handle GroupedTensorClass(reinterpret_cast<PyObject*>(GroupedTensorStoragePythonClass));
   py::object out_py = GroupedTensorClass(

@@ -339,6 +339,15 @@ class GroupedTensor:
         )
 
     @staticmethod
+    def make_tensor_offsets(first_dims: torch.Tensor, logical_last_dim: int) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.zeros(1, device=first_dims.device, dtype=first_dims.dtype),
+                torch.cumsum(first_dims * logical_last_dim, dim=0),
+            ]
+        )
+
+    @staticmethod
     def make_grouped_tensor(
         num_tensors: int,
         first_dims: Optional[torch.Tensor],
@@ -394,12 +403,7 @@ class GroupedTensor:
             # Kernels need to calculate precise pointers based on size of elements.
 
             # TODO(ksivaman): Single kernel + remove the host offset calculation.
-            tensor_offsets = torch.cat(
-                [
-                    torch.zeros(1, device=first_dims.device, dtype=first_dims.dtype),
-                    torch.cumsum(first_dims * logical_last_dim, dim=0),
-                ]
-            )
+            tensor_offsets = GroupedTensor.make_tensor_offsets(first_dims, logical_last_dim)
             offsets = tensor_offsets.tolist()
             first_dims_list = first_dims.tolist()
             for i in range(num_tensors):
@@ -464,7 +468,7 @@ class GroupedTensor:
                 total_columnwise_scale_elements = 0
                 columnwise_scale_inv_offsets = [0]
                 for i, s in enumerate(shape):
-                    scale_inv_shape = quantizer.get_scale_shape(s, False)
+                    scale_inv_shape = quantizer.get_scale_shape(s, True)
                     columnwise_scale_elements = math.prod(scale_inv_shape)
                     total_columnwise_scale_elements += columnwise_scale_elements
                     if i < num_tensors - 1:
