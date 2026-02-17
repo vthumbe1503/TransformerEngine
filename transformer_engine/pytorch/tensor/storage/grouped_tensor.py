@@ -628,8 +628,6 @@ class GroupedTensor:
 
         no_quantization = self.quantizer is None
 
-        assert self.shape is not None, "Shape must be set for splitting a GroupedTensor."
-
         # Case 1: No quantization - return regular torch tensors
         if no_quantization:
             for i in range(self.num_tensors):

@@ -272,16 +272,13 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2_in_row_scale = fc2_in_row_scale.view(
             in_shape[0], fc2_weight_shape[1] // 32
         )
-        # Do not call .contiguous() so GEMM swizzled layout from kernel is preserved for wgrad.
         fc2_in_col_data = fc1_kernel_out["d_col_tensor"]
         fc2_in_col_data = fc2_in_col_data.permute(2, 0, 1)
         fc2_in_col_data = fc2_in_col_data.view(in_shape[0], fc2_weight_shape[1]).contiguous()
         fc2_in_col_scale = fc1_kernel_out["sfd_col_tensor"]
         fc2_in_col_scale = fc2_in_col_scale.permute(5, 2, 4, 0, 1, 3)
         fc2_in_col_scale = fc2_in_col_scale.view(in_shape[0] // 32, fc2_weight_shape[1]).contiguous()
-        # Do not call .contiguous() so GEMM swizzled layout from kernel is preserved for wgrad.
-        # FC2 input scales are already in GEMM swizzled layout from the kernel; ensure
-        # quantizer.optimize_for_gemm so GroupedTensor reports swizzled for grouped GEMM.
+
         for quantizer in fc2_input_quantizers:
             quantizer.optimize_for_gemm = True
         grouped_fc2_x = make_grouped_tensor_from_buffers(
@@ -296,7 +293,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             quantizer=fc2_input_quantizers[0],
         )
 
-        # FC2 GEMM (use weight buffers directly, no copy)
+        # FC2 GEMM 
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
         fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
         grouped_fc2_out = make_grouped_output(fc2_out, split_sizes)
@@ -314,11 +311,15 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             accumulate=False,
         )
 
-        # Prepare input tensors for backward pass. When weight_requires_grad we must keep
-        # grouped_fc1_x/grouped_fc2_x data and scale_inv so backward can use them for wgrad GEMM.
+        # Prepare input tensors for backward pass
         if not weight_requires_grad:
             grouped_fc1_x = None
             grouped_fc2_x = None
+        else:
+            grouped_fc1_x.data = None
+            grouped_fc1_x.scale_inv = None
+            grouped_fc2_x.data = None
+            grouped_fc2_x.scale_inv = None
 
         # Save state for backward pass
         if requires_grad:
