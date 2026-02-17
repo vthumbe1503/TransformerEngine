@@ -479,14 +479,13 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK) group_quantize_mxfp8_kernel
       const size_t global_scales_offset_Y = scales_offset_Y_colwise + stage;
       const size_t global_scales_offset_X = scales_offset_X_colwise;
 
-      size_t scale_idx;
+      size_t scale_idx = 0;
       if constexpr (WITH_GEMM_SWIZZLED_SCALES) {
         scale_idx = gemm_swizzled_scale_idx(global_scales_offset_X, global_scales_offset_Y,
                                             DIVUP(rows, static_cast<size_t>(128)));
       } else {
         scale_idx = global_scales_offset_Y * scale_stride_colwise + global_scales_offset_X;
       }
-
       scales_colwise[scale_idx] = biased_exponent;
 
       const float block_scale_inverse = ptx::exp2f_rcp(biased_exponent);
@@ -613,14 +612,13 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK) group_quantize_mxfp8_kernel
       const int stage_scales_offset_Y = scales_offset_Y_rowwise + stage_offset_Y;
       const int stage_scales_offset_X = scales_offset_X_rowwise;
 
-      size_t scale_idx;
+      size_t scale_idx = 0;
       if constexpr (WITH_GEMM_SWIZZLED_SCALES) {
         scale_idx = gemm_swizzled_scale_idx(stage_scales_offset_Y, stage_scales_offset_X,
                                             DIVUP(cols, static_cast<size_t>(128)));
       } else {
         scale_idx = stage_scales_offset_Y * scale_stride_rowwise + stage_scales_offset_X;
       }
-
       scales_rowwise[scale_idx] = biased_exponent;
 
       const float block_scale_inverse = ptx::exp2f_rcp(biased_exponent);
@@ -821,6 +819,8 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   const dim3 grid(blocks);
   const size_t block_size = THREADS_PER_CHUNK;
 
+  const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
+
   // Logical shape of a tensor with varying all dims is [1, M*K]
   if (shape_rep != ShapeRepresentation::VARYING_BOTH_DIMS) {
     NVTE_CHECK(first_logical_dim % 128 == 0,
@@ -844,8 +844,6 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   if (use_colwise_scaling) {
     NVTE_CHECK(scales_colwise_ptr != nullptr, "Columnwise scaling tensor must be allocated");
   }
-
-  const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
 
   const size_t dbias_rows = DIVUP(first_logical_dim, CHUNK_DIM_Y);
   const size_t dbias_cols = last_logical_dim;
@@ -978,11 +976,9 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
                 common::reduce_dbias<IType>(workspace_ptr, dbias, dbias_rows, dbias_cols, stream);
               }
 
-              NVTE_CHECK_CUDA(cudaGetLastError());
-
-          );  // NOLINT(*)
-      );      // NOLINT(*)
-  );          // NOLINT(*)
+              NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
+      );                                              // NOLINT(*)
+  );                                                  // NOLINT(*)
 }
 
 }  // namespace mxfp8
