@@ -239,7 +239,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc1_dy_row_scale = fc1_dy_row_scale.view(out_shape[0], fc1_weight_shape[0] // 32).contiguous()
         fc1_dy_col_data = fc2_dgrad_kernel_out["d_col_tensor"]
         fc1_dy_col_data = fc1_dy_col_data.permute(2, 0, 1)
-        fc1_dy_col_data = fc1_dy_col_data.view(fc1_weight_shape[0], out_shape[0]).contiguous()
+        fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_col_scale = fc2_dgrad_kernel_out["sfd_col_tensor"]
         fc1_dy_col_scale = fc1_dy_col_scale.permute(5, 2, 4, 0, 1, 3)
         # Column-wise scale for (m, n): shape (m/32, n)
