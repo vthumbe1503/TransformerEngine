@@ -404,10 +404,19 @@ class GroupedTensor:
 
             # TODO(ksivaman): Single kernel + remove the host offset calculation.
             tensor_offsets = GroupedTensor.make_tensor_offsets(first_dims, logical_last_dim)
-            offsets = tensor_offsets.tolist()
-            first_dims_list = first_dims.tolist()
-            for i in range(num_tensors):
-                shape.append((first_dims_list[i], logical_last_dim))
+            if (
+                first_dims.device.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                # Avoid host sync during CUDA graph capture.
+                offsets = None
+                shape = None
+            else:
+                offsets = tensor_offsets.tolist()
+                first_dims_list = first_dims.tolist()
+                for i in range(num_tensors):
+                    shape.append((first_dims_list[i], logical_last_dim))
         else:
             offsets = [
                 i * logical_first_dim * logical_last_dim // num_tensors
@@ -436,6 +445,11 @@ class GroupedTensor:
         scale = None
         scale_inv_offsets = None
         columnwise_scale_inv_offsets = None
+        if shape is None and not no_quantization:
+            raise RuntimeError(
+                "Cannot materialize quantized GroupedTensor with varying first dims "
+                "during CUDA graph capture."
+            )
         if no_quantization:
             assert dtype is not None, "dtype must be provided for unquantized GroupedTensor"
             if rowwise_usage:
@@ -605,7 +619,8 @@ class GroupedTensor:
             logical_shape=logical_shape,
         )
 
-        grouped_tensor.quantized_tensors = grouped_tensor.split_into_quantized_tensors()
+        if grouped_tensor.shape is not None:
+            grouped_tensor.quantized_tensors = grouped_tensor.split_into_quantized_tensors()
         return grouped_tensor
 
     def split_into_quantized_tensors(
@@ -624,6 +639,11 @@ class GroupedTensor:
         to expose the weights as separate parameters.
         """
 
+        if self.shape is None:
+            raise RuntimeError(
+                "GroupedTensor host metadata (shape/offsets) is not available. "
+                "Recreate the tensor outside CUDA graph capture if you need a split view."
+            )
         result = []
 
         no_quantization = self.quantizer is None

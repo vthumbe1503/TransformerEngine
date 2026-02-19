@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 from collections.abc import Callable, Iterable
+import os
 import functools
 from typing import Any, Optional
 
@@ -26,6 +27,9 @@ from .._common import (
     make_grouped_tensor_from_buffers,
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
+)
+from transformer_engine.common.triton.triton_repack import (
+    repack_swiglu_fc2_col_scale,
 )
 
 
@@ -255,12 +259,12 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         # Unpack kernel outputs
         # Note: Fused kernel outputs tensors with non-contiguous
         # logical dims.
-        # Row-wise data logical shape: (sum(m), k, 1)
+        # Row-wise data logical shape: (sum(m_splits), k, 1)
         # Row-wise scale logical shape: (32 (block row), 4 (block row),
-        #   sum(m)/128, 4 (block col), k/128, 1)
-        # Column-wise data logical shape: (sum(m), k, 1)
+        #   sum(m_splits)/128, 4 (block col), k/128, 1)
+        # Column-wise data logical shape: (sum(m_splits), k, 1)
         # Column-wise scale logical shape: (32 (block col), 4 (block col),
-        #   k/128, 4 (block row), sum(m)/128, 1)
+        #   k/128, 4 (block row), sum(m_splits)/128, 1)
         swiglu_in = fc1_kernel_out["c_tensor"]
         swiglu_in = swiglu_in.permute(2, 0, 1)
         swiglu_in = swiglu_in.view(in_shape[0], fc1_weight_shape[0])
@@ -277,7 +281,14 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2_in_col_data = fc2_in_col_data.view(in_shape[0], fc2_weight_shape[1]).contiguous()
         fc2_in_col_scale = fc1_kernel_out["sfd_col_tensor"]
         fc2_in_col_scale = fc2_in_col_scale.permute(5, 2, 4, 0, 1, 3)
-        fc2_in_col_scale = fc2_in_col_scale.view(in_shape[0] // 32, fc2_weight_shape[1]).contiguous()
+        # Repack columnwise scales on GPU to preserve group ordering.
+        fc2_in_col_scale = repack_swiglu_fc2_col_scale(
+            fc2_in_col_scale,
+            split_sizes,
+            fc2_weight_shape[1],
+            in_shape[0] // 32,
+        )
+
 
         for quantizer in fc2_input_quantizers:
             quantizer.optimize_for_gemm = True
@@ -315,11 +326,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         if not weight_requires_grad:
             grouped_fc1_x = None
             grouped_fc2_x = None
-        else:
-            grouped_fc1_x.data = None
-            grouped_fc1_x.scale_inv = None
-            grouped_fc2_x.data = None
-            grouped_fc2_x.scale_inv = None
 
         # Save state for backward pass
         if requires_grad:
