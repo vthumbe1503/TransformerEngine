@@ -274,8 +274,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK) group_quantize_mxfp8_kernel
   const size_t scale_stride_colwise = DIVUP_TO_MULTIPLE(cols, 128);
 
   const bool is_single_tensor =
-      (shape_rep == SAME_BOTH_DIMS) ||
-      (shape_rep == VARYING_FIRST_DIM && !WITH_GEMM_SWIZZLED_SCALES);
+      (shape_rep == SAME_BOTH_DIMS) || (shape_rep == VARYING_FIRST_DIM);
 
   // Grouped tensor can be treated as continuous when is_single_tensor.
   const size_t tensor_base = is_single_tensor ? 0 : static_cast<size_t>(offsets_ptr[tensor_id]);
@@ -811,11 +810,8 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   }
 
   const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
-  // Treat a grouped tensor with const last dims as a single tensor unless
-  // GEMM-swizzled scales are requested (per-group scale layout is required then).
   const bool is_single_tensor =
-      (shape_rep == SAME_BOTH_DIMS) ||
-      (shape_rep == VARYING_FIRST_DIM && !with_gemm_swizzled_scales);
+      (shape_rep == SAME_BOTH_DIMS) || (shape_rep == VARYING_FIRST_DIM);
 
   NVTE_CHECK(input->num_tensors == output->num_tensors,
              "Number of input and output tensors must be same.");
