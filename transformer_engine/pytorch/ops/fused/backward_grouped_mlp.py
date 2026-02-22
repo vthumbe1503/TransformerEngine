@@ -26,13 +26,12 @@ from ..fuser import register_backward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
     is_quantized_tensor,
-    make_grouped_output,
     make_grouped_tensor_from_buffers,
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
 from transformer_engine.common.triton.triton_repack import (
-    repack_swiglu_fc2_col_scale,
+    triton_repack_for_split_by_dim2_concat_along_dim0,
 )
 
 
@@ -247,9 +246,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_col_scale = fc2_dgrad_kernel_out["sfd_col_tensor"]
         fc1_dy_col_scale = fc1_dy_col_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_col_scale = repack_swiglu_fc2_col_scale(
+        fc1_dy_col_scale = triton_repack_for_split_by_dim2_concat_along_dim0(
             fc1_dy_col_scale,
-            split_sizes,
+            split_sizes/128,
             fc1_weight_shape[0],
             out_shape[0] // 32,
         )
@@ -260,8 +259,6 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         grad_scales = grad_scales.view(-1).to(dtype=dtype)
 
         # FC1 grad output for dgrad and wgrad GEMMs
-        for quantizer in fc1_ctx.grad_output_quantizers:
-            quantizer.optimize_for_gemm = True
         grouped_fc1_dy = make_grouped_tensor_from_buffers(
             num_groups=num_groups,
             data=fc1_dy_row_data,
@@ -272,6 +269,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             logical_last_dim=fc1_weight_shape[0],
             dtype=dtype,
             quantizer=fc1_ctx.grad_output_quantizers[0],
+            with_gemm_swizzled_scales=True,
         )
 
         # FC2 wgrad GEMM
@@ -357,8 +355,15 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 fc1_ctx.weight_quantizers[0],
                 device,
                 dtype,
+                with_gemm_swizzled_scales=True,
             )
-            grouped_grad_input = make_grouped_output(grad_input, split_sizes)
+            grouped_grad_input = make_grouped_tensor_from_buffers(
+                num_groups=num_groups,
+                data=grad_input,
+                split_sizes=split_sizes,
+                dtype=grad_input.dtype,
+                logical_last_dim=fc1_weight_shape[1],
+            )
             general_grouped_gemm_for_grouped_tensor(
                 grouped_fc1_w,
                 grouped_fc1_dy,

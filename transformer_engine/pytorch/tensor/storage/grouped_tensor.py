@@ -69,6 +69,7 @@ class GroupedTensor:
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
         logical_shape: Optional[Tuple[int, int]] = None,
+        with_gemm_swizzled_scales: bool = False,
     ) -> None:
         """
         Initialize a GroupedTensor.
@@ -137,6 +138,8 @@ class GroupedTensor:
         # Hold a reference to the quantized tensors that occupy same storage as the GroupedTensor.
         # Used as a convenience.
         self.quantized_tensors = None
+
+        self.with_gemm_swizzled_scales = with_gemm_swizzled_scales
 
     def has_data(self) -> bool:
         """
@@ -432,7 +435,7 @@ class GroupedTensor:
 
         rowwise_usage = quantizer.rowwise_usage if not no_quantization else True
         columnwise_usage = quantizer.columnwise_usage if not no_quantization else False
-
+        with_gemm_swizzled_scales = quantizer.optimize_for_gemm if not no_quantization else False
         # Calculate total elements across all tensors
         total_elements = logical_first_dim * logical_last_dim
 
@@ -611,6 +614,7 @@ class GroupedTensor:
             scale_inv_offsets=scale_inv_offsets,
             columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
             logical_shape=logical_shape,
+            with_gemm_swizzled_scales=with_gemm_swizzled_scales,
         )
 
         if grouped_tensor.shape is not None:

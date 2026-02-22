@@ -23,13 +23,12 @@ from ..fuser import register_forward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
     is_quantized_tensor,
-    make_grouped_output,
     make_grouped_tensor_from_buffers,
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
 from transformer_engine.common.triton.triton_repack import (
-    repack_swiglu_fc2_col_scale,
+    triton_repack_for_split_by_dim2_concat_along_dim0,
 )
 
 
@@ -177,10 +176,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             for quantizer in fc2_weight_quantizers:
                 quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
             fc2_ws = fc2_op._quantize_weights_mxfp8(fc2_ws, fc2_weight_quantizers)
-        for quantizer in fc1_weight_quantizers:
-            quantizer.optimize_for_gemm = True
-        for quantizer in fc2_weight_quantizers:
-            quantizer.optimize_for_gemm = True
 
         # Group-quantize input tensor and convert dtypes if needed
         fc1_x = maybe_dequantize(input_, dtype)
@@ -282,16 +277,14 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2_in_col_scale = fc1_kernel_out["sfd_col_tensor"]
         fc2_in_col_scale = fc2_in_col_scale.permute(5, 2, 4, 0, 1, 3)
         # Repack columnwise scales on GPU to preserve group ordering.
-        fc2_in_col_scale = repack_swiglu_fc2_col_scale(
+        fc2_in_col_scale = triton_repack_for_split_by_dim2_concat_along_dim0(
             fc2_in_col_scale,
-            split_sizes,
+            split_sizes/128,
             fc2_weight_shape[1],
             in_shape[0] // 32,
         )
 
-
-        for quantizer in fc2_input_quantizers:
-            quantizer.optimize_for_gemm = True
+        # FC2 inputs scales are already swizzled/optimized for GEMM
         grouped_fc2_x = make_grouped_tensor_from_buffers(
             num_groups=num_groups,
             data=fc2_in_row_data,
@@ -302,17 +295,27 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             logical_last_dim=fc2_weight_shape[1],
             dtype=dtype,
             quantizer=fc2_input_quantizers[0],
+            with_gemm_swizzled_scales=True
         )
 
         # FC2 GEMM 
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
         fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
-        grouped_fc2_out = make_grouped_output(fc2_out, split_sizes)
+        grouped_fc2_out = make_grouped_tensor_from_buffers(
+            num_groups=num_groups,
+            data=fc2_out,
+            split_sizes=split_sizes,
+            dtype=fc2_out.dtype,
+            logical_last_dim=fc2_weight_shape[0],
+        )
+
+        # weights needs to be swizzled/optimized for GEMM
         grouped_fc2_w = make_grouped_tensor_from_mxfp8_weights(
             fc2_ws,
             fc2_weight_quantizers[0],
             device,
             dtype,
+            with_gemm_swizzled_scales=True
         )
         general_grouped_gemm_for_grouped_tensor(
             grouped_fc2_w,

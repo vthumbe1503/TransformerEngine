@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import functools
+import gc
 import io
 import math
 import random
@@ -18,6 +19,7 @@ import transformer_engine
 import transformer_engine.common.recipe
 import transformer_engine.pytorch as te
 import transformer_engine.pytorch.ops as te_ops
+
 from transformer_engine.pytorch.ops.fused import (
     BackwardActivationBias,
     BackwardAddRMSNorm,
@@ -3435,6 +3437,160 @@ class TestSequentialModules:
             assert_close_grads(getattr(fc2, f"bias{group_idx}"), fc2_bs_ref[group_idx], **tols)
             assert_close_grads(getattr(fc1, f"weight{group_idx}"), fc1_ws_ref[group_idx], **tols)
             assert_close_grads(getattr(fc1, f"bias{group_idx}"), fc1_bs_ref[group_idx], **tols)
+
+    @pytest.mark.parametrize("dtype", _dtypes)
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_grouped_mlp_cuda_graph_safe_mxfp8(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device = "cuda",
+        group_size: int = 4,
+        hidden_size: int = 256,
+        split_alignment: int = 256,
+        glu_interleave_size: int = 32,
+    ) -> None:
+        """Grouped MLP forward+backward should be CUDA graph capturable (MXFP8)."""
+
+        if not te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+        if dtype not in (torch.bfloat16, torch.float16):
+            pytest.skip("MXFP8 fused grouped MLP is only supported with BF16/FP16")
+
+        split_sizes = [split_alignment * (i + 1) for i in range(group_size)]
+        random.shuffle(split_sizes)
+        split_sizes = torch.tensor(split_sizes, dtype=torch.int64, device=device)
+        in_shape = (split_sizes.sum().item(), hidden_size)
+
+        recipe = make_recipe("mxfp8")
+        with te.quantized_model_init(enabled=True, recipe=recipe):
+            fc1 = te_ops.GroupedLinear(
+                group_size,
+                hidden_size,
+                2 * hidden_size,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            fc2 = te_ops.GroupedLinear(
+                group_size,
+                hidden_size,
+                hidden_size,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            module = te_ops.Sequential(
+                fc1,
+                te_ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size),
+                fc2,
+            )
+
+        static_split_sizes = split_sizes.clone()
+
+        def train_step(
+            x: torch.Tensor,
+            probs: torch.Tensor,
+            dy: torch.Tensor,
+            out_buf: torch.Tensor,
+            *,
+            use_graphed: bool,
+        ) -> torch.Tensor:
+            with te.autocast(enabled=True, recipe=recipe):
+                out = (
+                    graphed_module(x, static_split_sizes, probs, static_split_sizes)
+                    if use_graphed
+                    else module(x, static_split_sizes, probs, static_split_sizes)
+                )
+            out.backward(dy)
+            out_buf.copy_(out)
+            return out_buf
+
+        # Warmup to initialize kernels and allocator state.
+        warmup_x = torch.randn(in_shape, device=device, dtype=dtype, requires_grad=True)
+        warmup_probs = torch.randn((in_shape[0],), device=device, dtype=dtype, requires_grad=True)
+        warmup_dy = torch.randn(in_shape, device=device, dtype=dtype)
+        warmup_out = torch.empty((in_shape[0], hidden_size), device=device, dtype=dtype)
+        # Single forward+backward to initialize MXFP8 grad cache.
+        train_step(warmup_x, warmup_probs, warmup_dy, warmup_out, use_graphed=False)
+        # Clear warmup graph references before capture.
+        del warmup_out, warmup_x, warmup_probs, warmup_dy
+        gc.collect()
+        torch.cuda.synchronize()
+
+        static_x = torch.randn(in_shape, device=device, dtype=dtype, requires_grad=True)
+        static_probs = torch.randn((in_shape[0],), device=device, dtype=dtype, requires_grad=True)
+        static_dy = torch.randn(in_shape, device=device, dtype=dtype)
+        static_out_buf = torch.empty((in_shape[0], hidden_size), device=device, dtype=dtype)
+
+        forward_ops = module._module_groups[0]._forward_ops
+        backward_ops = module._module_groups[0]._backward_ops
+        assert len(forward_ops) == 1
+        assert isinstance(
+            forward_ops[0][0],
+            te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8,
+        )
+        assert len(backward_ops) == 1
+        assert isinstance(
+            backward_ops[0][0],
+            te_ops.fused.BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8,
+        )
+
+        graphed_module = te.make_graphed_callables(
+            module,
+            (static_x, static_split_sizes, static_probs, static_split_sizes),
+            num_warmup_iters=3,
+            enabled=True,
+            recipe=recipe,
+        )
+
+        fresh_x = torch.randn_like(static_x)
+        fresh_probs = torch.randn_like(static_probs)
+        fresh_dy = torch.randn_like(static_dy)
+        with torch.no_grad():
+            static_x.copy_(fresh_x)
+            static_probs.copy_(fresh_probs)
+            static_dy.copy_(fresh_dy)
+
+        for param in module.parameters():
+            param.grad = torch.zeros_like(param)
+        if static_x.grad is not None:
+            static_x.grad.zero_()
+        if static_probs.grad is not None:
+            static_probs.grad.zero_()
+
+        graph_out = train_step(
+            static_x, static_probs, static_dy, static_out_buf, use_graphed=True
+        ).detach().clone()
+        torch.cuda.synchronize()
+        graph_dx = static_x.grad.detach().clone()
+        graph_dprobs = static_probs.grad.detach().clone()
+        graph_param_grads = [param.grad.detach().clone() for param in module.parameters()]
+
+        for param in module.parameters():
+            param.grad.zero_()
+        static_x.grad.zero_()
+        static_probs.grad.zero_()
+
+        expected_x = fresh_x.detach().clone().requires_grad_(True)
+        expected_probs = fresh_probs.detach().clone().requires_grad_(True)
+        expected_dy = fresh_dy.detach().clone()
+        with te.autocast(enabled=True, recipe=recipe):
+            expected_out = module(
+                expected_x,
+                static_split_sizes,
+                expected_probs,
+                static_split_sizes,
+            )
+        expected_out.backward(expected_dy)
+
+        tols = dtype_tols(dtype)
+        assert_close(graph_out, expected_out, **tols)
+        assert_close(graph_dx, expected_x.grad, **tols)
+        assert_close(graph_dprobs, expected_probs.grad, **tols)
+        for graph_grad, param in zip(graph_param_grads, module.parameters()):
+            assert_close(graph_grad, param.grad, **tols)
+
 
 
 class TestCustomOps:

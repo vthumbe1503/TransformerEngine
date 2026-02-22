@@ -14,12 +14,10 @@ import triton.language as tl
 
 
 @triton.jit
-def _repack_swiglu_fc2_col_scale_kernel(
+def _repack_tensor(
     in_ptr,
     out_ptr,
-    prefix_m32_ptr,
-    prefix_m128_ptr,
-    split_m128_ptr,
+    split_tensor_ptr,
     stride_b,
     stride_c,
     stride_d,
@@ -41,24 +39,37 @@ def _repack_swiglu_fc2_col_scale_kernel(
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    last_prefix = tl.load(prefix_m32_ptr + (num_groups - 1))
+    group_offs = tl.arange(0, MAX_GROUPS)
+    split_tensor = tl.load(
+        split_tensor_ptr + group_offs,
+        mask=group_offs < num_groups,
+        other=0,
+    ).to(tl.int64)
+
+    sum_m128 = tl.sum(split_tensor, axis=0)
+    last_prefix = sum_m128 * 4
     row_mask = rows < last_prefix
     col_mask = cols < k
     rows_safe = tl.where(row_mask, rows, 0)
     cols_safe = tl.where(col_mask, cols, 0)
 
-    group_offs = tl.arange(0, MAX_GROUPS)
-    prefix_end = tl.load(
-        prefix_m32_ptr + group_offs,
-        mask=group_offs < num_groups,
-        other=2147483647,
-    )
+    i = group_offs[:, None]
+    j = group_offs[None, :]
+    prefix_end_m128 = tl.sum(split_tensor[None, :] * (j <= i), axis=1)
+    prefix_end = tl.where(group_offs < num_groups, prefix_end_m128 * 4, 2147483647)
     group = tl.sum(rows_safe[:, None] >= prefix_end[None, :], axis=1)
 
     prev = tl.maximum(group - 1, 0)
-    start_m32 = tl.load(prefix_m32_ptr + prev, mask=group > 0, other=0)
-    start_m128 = tl.load(prefix_m128_ptr + prev, mask=group > 0, other=0)
-    m128_g = tl.load(split_m128_ptr + group, mask=group < num_groups, other=0)
+    start_m128 = tl.sum(
+        tl.where(prev[:, None] == group_offs[None, :], prefix_end_m128[None, :], 0),
+        axis=1,
+    )
+    start_m128 = tl.where(group > 0, start_m128, 0)
+    start_m32 = start_m128 * 4
+    m128_g = tl.sum(
+        tl.where(group[:, None] == group_offs[None, :], split_tensor[None, :], 0),
+        axis=1,
+    )
     m128_g_safe = tl.maximum(m128_g, 1)
 
     local_row = rows_safe - start_m32
@@ -72,6 +83,7 @@ def _repack_swiglu_fc2_col_scale_kernel(
     stride_out_m = tl.full((), stride_out_m, tl.int64)
     stride_out_n = tl.full((), stride_out_n, tl.int64)
 
+    k = tl.full((), k, tl.int64)
     linear = local_row[:, None].to(tl.int64) * k + cols_safe[None, :].to(tl.int64)
     k128 = k // 128
     g = linear % 4
@@ -107,9 +119,9 @@ def _repack_swiglu_fc2_col_scale_kernel(
     tl.store(out_ptrs, vals, mask=mask)
 
 
-def repack_swiglu_fc2_col_scale(
-    fc2_in_col_scale: torch.Tensor,
-    split_sizes: torch.Tensor,
+def triton_repack_for_split_by_dim2_concat_along_dim0(
+    tensor_to_split: torch.Tensor,
+    split_tensor: torch.Tensor,
     k: int,
     total_rows: int,
     *,
@@ -117,36 +129,15 @@ def repack_swiglu_fc2_col_scale(
     block_n: int = 128,
     max_groups: int = 256,
 ) -> torch.Tensor:
-    """Repack columnwise scales to match split-by-dim2 + view(-1, k) layout on GPU."""
-    if not fc2_in_col_scale.is_cuda:
-        raise ValueError("fc2_in_col_scale must be on CUDA for Triton repack.")
-    if split_sizes.device.type != "cuda":
-        raise ValueError("split_sizes must be on CUDA for Triton repack.")
-    if int(split_sizes.numel()) > max_groups:
-        raise ValueError(
-            f"num_groups={int(split_sizes.numel())} exceeds max_groups={max_groups}"
-        )
-    if split_sizes.dtype != torch.int32:
-        split_sizes_i32 = split_sizes.to(dtype=torch.int32)
-    else:
-        split_sizes_i32 = split_sizes
+    """Triton kernel equivalent to:
+    torch.cat(torch.split(tensor_to_split, split_tensor.cpu(), dim=2), dim=0)
+    Triton kernel is to avoid copy split_tensor to CPU so we dont break CUDA graph
+    """
 
-    split_m128 = split_sizes_i32 // 128
-    split_m32 = split_m128 * 4
-    prefix_m32 = torch.cumsum(split_m32, dim=0)
-    prefix_m128 = torch.cumsum(split_m128, dim=0)
+    out = torch.empty((total_rows, k), dtype=torch.uint8, device=tensor_to_split.device)
+    tensor_to_split_view = tensor_to_split.view(torch.uint8)
 
-    out = torch.empty((total_rows, k), dtype=fc2_in_col_scale.dtype, device=fc2_in_col_scale.device)
-
-    in_is_float8 = "float8" in str(fc2_in_col_scale.dtype)
-    if in_is_float8:
-        fc2_in_col_scale_view = fc2_in_col_scale.view(torch.uint8)
-        out_view = out.view(torch.uint8)
-    else:
-        fc2_in_col_scale_view = fc2_in_col_scale
-        out_view = out
-
-    stride_b, stride_c, stride_d, stride_e, stride_f, stride_g = fc2_in_col_scale_view.stride()
+    stride_b, stride_c, stride_d, stride_e, stride_f, stride_g = tensor_to_split_view.stride()
     stride_out_m, stride_out_n = out.stride()
 
     grid = (
@@ -154,12 +145,10 @@ def repack_swiglu_fc2_col_scale(
         triton.cdiv(k, block_n),
     )
 
-    _repack_swiglu_fc2_col_scale_kernel[grid](
-        fc2_in_col_scale_view,
-        out_view,
-        prefix_m32,
-        prefix_m128,
-        split_m128,
+    _repack_tensor[grid](
+        tensor_to_split_view,
+        out,
+        split_tensor,
         stride_b,
         stride_c,
         stride_d,
@@ -170,7 +159,7 @@ def repack_swiglu_fc2_col_scale(
         stride_out_n,
         total_rows,
         k,
-        int(split_sizes_i32.numel()),
+        int(split_tensor.numel()),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         MAX_GROUPS=max_groups,

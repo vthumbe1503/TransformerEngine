@@ -154,7 +154,6 @@ std::pair<GroupedTensorWrapper, py::object> NoneQuantizer::create_grouped_tensor
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                getTensorShape(*tensor_offsets));
   }
-
   py::handle GroupedTensorClass(reinterpret_cast<PyObject*>(GroupedTensorStoragePythonClass));
   py::object out_py = GroupedTensorClass(
       "num_tensors"_a = num_tensors, "quantizer"_a = std::move(quantizer),
@@ -166,7 +165,8 @@ std::pair<GroupedTensorWrapper, py::object> NoneQuantizer::create_grouped_tensor
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = false);
 
   return {std::move(out_cpp), std::move(out_py)};
 }
@@ -329,7 +329,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = this->optimize_for_gemm);
 
   return {std::move(out_cpp), std::move(out_py)};
 }
@@ -604,7 +605,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8CurrentScalingQuantizer::creat
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = this->optimize_for_gemm);
 
   return {std::move(out_cpp), std::move(out_py)};
 }
@@ -910,7 +912,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                getTensorShape(*tensor_offsets));
   }
-
+  
   py::handle GroupedTensorClass(reinterpret_cast<PyObject*>(GroupedTensorStoragePythonClass));
   py::object out_py = GroupedTensorClass(
       "num_tensors"_a = num_tensors, "quantizer"_a = std::move(quantizer),
@@ -923,7 +925,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = this->optimize_for_gemm);
 
   return {std::move(out_cpp), std::move(out_py)};
 }
@@ -1301,7 +1304,8 @@ std::pair<GroupedTensorWrapper, py::object> MXFP8Quantizer::create_grouped_tenso
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = this->optimize_for_gemm);
 
   return {std::move(out_cpp), std::move(out_py)};
 }
@@ -1685,7 +1689,8 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
       "last_dims"_a = py::none(),
       "tensor_offsets"_a = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none(),
       "logical_shape"_a = std::vector<int64_t>{static_cast<int64_t>(logical_first_dim),
-                                               static_cast<int64_t>(logical_last_dim)});
+                                               static_cast<int64_t>(logical_last_dim)},
+      "with_gemm_swizzled_scales"_a = this->optimize_for_gemm);
 
   return {std::move(out_cpp), std::move(out_py)};
 }

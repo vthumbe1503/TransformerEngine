@@ -284,12 +284,10 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
 
 
     bool with_gemm_swizzled = false;
-    if (!quantizer.is_none()) {
-      with_gemm_swizzled =
-          py::hasattr(quantizer, "optimize_for_gemm") && quantizer.attr("optimize_for_gemm").cast<bool>();
+    if(!tensor.attr("with_gemm_swizzled_scales").is_none()) {
+      with_gemm_swizzled = tensor.attr("with_gemm_swizzled_scales").cast<bool>();
     }
-    nvte_set_grouped_tensor_swizzled_scales(ret.data(),
-                                           static_cast<uint8_t>(with_gemm_swizzled));
+    ret.set_with_gemm_swizzled_scales(with_gemm_swizzled);
 
   return ret;
 }
