@@ -190,29 +190,3 @@ def make_grouped_tensor_from_mxfp8_weights(
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
 
-
-def make_grouped_output(
-    data: torch.Tensor,
-    split_sizes: torch.Tensor,
-) -> GroupedTensor:
-    """Build a GroupedTensor wrapping a contiguous output buffer with given split sizes for rowwise usage."""
-    return GroupedTensor(
-        num_tensors=int(split_sizes.numel()),
-        shape=None,
-        quantizer=None,
-        dtype=data.dtype,
-        data=data,
-        columnwise_data=None,
-        scale_inv=None,
-        columnwise_scale_inv=None,
-        amax=None,
-        columnwise_amax=None,
-        scale=None,
-        first_dims=split_sizes,
-        last_dims=None,
-        tensor_offsets=GroupedTensor.make_tensor_offsets(split_sizes, data.shape[-1]),
-        offsets=None,
-        scale_inv_offsets=None,
-        columnwise_scale_inv_offsets=None,
-        logical_shape=(data.shape[0], data.shape[-1]),
-    )
