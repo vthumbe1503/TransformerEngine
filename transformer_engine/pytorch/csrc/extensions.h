@@ -150,6 +150,13 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
+py::object te_general_grouped_gemm_for_grouped_tensor(py::handle A, bool transa, py::handle B,
+    bool transb, py::object C, py::handle D,
+    at::Tensor alpha, at::Tensor beta,
+    at::Tensor workspace_setup,
+    at::Tensor workspace_cublas,
+    int math_sm_count);
+
 /***************************************************************************************************
  * Transpose
  **************************************************************************************************/
@@ -254,6 +261,9 @@ py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::ob
                     std::optional<at::Tensor> noop_flag);
 
 py::object dequantize(const py::handle &input, DType otype);
+
+py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const size_t num_tensors,
+                          std::optional<at::Tensor> first_dims);
 
 std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &tensor_list,
                                               std::vector<py::handle> quantizer_list);

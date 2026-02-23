@@ -6,22 +6,33 @@
 
 from __future__ import annotations
 from collections.abc import Callable
+import os
 import functools
+from pickle import TRUE
 from typing import Optional
 
 import torch
 
 import transformer_engine_torch as tex
-from ...cpp_extensions import general_grouped_gemm
+from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor, general_grouped_gemm
 from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
 from ...quantization import Recipe
-from ...tensor import MXFP8Tensor
+from ...tensor import Quantizer
+from ...tensor.storage.grouped_tensor import GroupedTensor
 from ...utils import clear_tensor_data, get_device_compute_capability
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_backward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
-from .._common import is_quantized_tensor, maybe_dequantize
+from .._common import (
+    is_quantized_tensor,
+    make_grouped_tensor_from_buffers,
+    make_grouped_tensor_from_mxfp8_weights,
+    maybe_dequantize,
+)
+from transformer_engine.common.triton.triton_repack import (
+    triton_repack_for_split_by_dim2_concat_along_dim0,
+)
 
 
 class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
@@ -118,7 +129,6 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Saved tensors from FC1 forward
         saved_tensors = fc1_ctx.saved_tensors
         split_sizes, saved_tensors = saved_tensors[0], saved_tensors[1:]
-        fc1_xs, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
         fc1_ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
 
         # Saved tensors from scaled SwiGLU forward
@@ -127,14 +137,12 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Saved tensors from FC2 forward
         saved_tensors = fc2_ctx.saved_tensors
         _, saved_tensors = saved_tensors[0], saved_tensors[1:]  # Assume same split sizes as FC1
-        fc2_xs, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
         fc2_ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
 
         # Group splits
-        split_sizes_cpu = [int(s) for s in split_sizes.tolist()]
-        if len(split_sizes_cpu) != num_groups:
-            raise ValueError(f"Expected {num_groups} splits, but got {len(split_sizes_cpu)}.")
-        split_sizes = split_sizes.to(dtype=torch.int, device=device)
+        if int(split_sizes.numel()) != num_groups:
+            raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
+        split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
 
         # Split grad output tensor and convert dtypes if needed
@@ -142,8 +150,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         for quantizer in fc2_ctx.grad_output_quantizers:
             quantizer.set_usage(rowwise=True, columnwise=fc2_ctx.weight_requires_grad)
             quantizer.optimize_for_gemm = True
-        fc2_dys = tex.split_quantize(fc2_dy, split_sizes_cpu, fc2_ctx.grad_output_quantizers)
-
+        grouped_fc2_dy = tex.group_quantize(
+            fc2_dy, fc2_ctx.grad_output_quantizers[0], num_groups, split_sizes
+        )
         # Quantize FC2 weights to MXFP8 if needed
         if not is_quantized_tensor(fc2_ws[0]):
             for quantizer in fc2_ctx.weight_quantizers:
@@ -159,10 +168,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (sum(m), k, 1)
         # Scale logical shape: (32 (block row), 4 (block row),
         #   sum(m)/128, 4 (block col), k/128, 1)
-        fc2_dy_data = noop_cat([dy._rowwise_data for dy in fc2_dys])
+        fc2_dy_data = grouped_fc2_dy.data.view(out_shape[0], out_shape[1])
         fc2_dy_data = fc2_dy_data.view(dtype=torch.float8_e4m3fn)
         fc2_dy_data = fc2_dy_data.unsqueeze(0).permute(1, 2, 0)
-        fc2_dy_scales = noop_cat([dy._rowwise_scale_inv for dy in fc2_dys])
+        fc2_dy_scales = grouped_fc2_dy.scale_inv
         fc2_dy_scales = fc2_dy_scales.view(dtype=torch.float8_e8m0fnu)
         fc2_dy_scales = fc2_dy_scales.view(
             1,
@@ -228,39 +237,40 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         #   k/128, 4 (block row), sum(m)/128, 1)
         fc1_dy_row_data = fc2_dgrad_kernel_out["d_row_tensor"]
         fc1_dy_row_data = fc1_dy_row_data.permute(2, 0, 1)
-        fc1_dy_row_data = fc1_dy_row_data.view(out_shape[0], fc1_weight_shape[0])
-        fc1_dy_row_data = torch.split(fc1_dy_row_data.contiguous(), split_sizes_cpu)
+        fc1_dy_row_data = fc1_dy_row_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_row_scale = fc2_dgrad_kernel_out["sfd_row_tensor"]
         fc1_dy_row_scale = fc1_dy_row_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_row_scale = fc1_dy_row_scale.view(out_shape[0], fc1_weight_shape[0] // 32)
-        fc1_dy_row_scale = torch.split(fc1_dy_row_scale.contiguous(), split_sizes_cpu)
+        fc1_dy_row_scale = fc1_dy_row_scale.view(out_shape[0], fc1_weight_shape[0] // 32).contiguous()
         fc1_dy_col_data = fc2_dgrad_kernel_out["d_col_tensor"]
         fc1_dy_col_data = fc1_dy_col_data.permute(2, 0, 1)
-        fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0])
-        fc1_dy_col_data = torch.split(fc1_dy_col_data.contiguous(), split_sizes_cpu)
+        fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_col_scale = fc2_dgrad_kernel_out["sfd_col_tensor"]
         fc1_dy_col_scale = fc1_dy_col_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_col_scale = torch.split(fc1_dy_col_scale, [s // 128 for s in split_sizes_cpu], dim=2)
-        fc1_dy_col_scale = [s.contiguous().view(-1, fc1_weight_shape[0]) for s in fc1_dy_col_scale]
+        fc1_dy_col_scale = triton_repack_for_split_by_dim2_concat_along_dim0(
+            fc1_dy_col_scale,
+            split_sizes/128,
+            fc1_weight_shape[0],
+            out_shape[0] // 32,
+        )
+
+        # Column-wise scale for (m, n): shape (m/32, n)
+        fc1_dy_col_scale = fc1_dy_col_scale.contiguous().view(out_shape[0] // 32, fc1_weight_shape[0])
         grad_scales = fc2_dgrad_kernel_out["dprob_tensor"]
         grad_scales = grad_scales.view(-1).to(dtype=dtype)
 
-        # Construct MXFP8 tensors for FC1
-        fc1_dys = []
-        for group_idx in range(num_groups):
-            dy = MXFP8Tensor(
-                shape=(split_sizes_cpu[group_idx], fc1_weight_shape[0]),
-                dtype=dtype,
-                fp8_dtype=tex.DType.kFloat8E4M3,
-                rowwise_data=fc1_dy_row_data[group_idx],
-                rowwise_scale_inv=fc1_dy_row_scale[group_idx],
-                columnwise_data=fc1_dy_col_data[group_idx],
-                columnwise_scale_inv=fc1_dy_col_scale[group_idx],
-                quantizer=fc1_ctx.grad_output_quantizers[group_idx],
-                requires_grad=False,
-                with_gemm_swizzled_scales=True,
-            )
-            fc1_dys.append(dy)
+        # FC1 grad output for dgrad and wgrad GEMMs
+        grouped_fc1_dy = make_grouped_tensor_from_buffers(
+            num_groups=num_groups,
+            data=fc1_dy_row_data,
+            columnwise_data=fc1_dy_col_data,
+            scale_inv=fc1_dy_row_scale,
+            columnwise_scale_inv=fc1_dy_col_scale,
+            split_sizes=split_sizes,
+            logical_last_dim=fc1_weight_shape[0],
+            dtype=dtype,
+            quantizer=fc1_ctx.grad_output_quantizers[0],
+            with_gemm_swizzled_scales=True,
+        )
 
         # FC2 wgrad GEMM
         fc2_dws = [None] * num_groups
@@ -280,25 +290,28 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 accumulate_into_main_grad = not getattr(
                     fc2_op.weight0, "overwrite_main_grad", False
                 )
-            else:
-                for group_idx in range(num_groups):
-                    fc2_dws[group_idx] = torch.empty(
-                        fc2_weight_shape,
-                        dtype=dtype,
-                        device=device,
-                    )
 
             # Launch GEMM
-            general_grouped_gemm(
-                fc2_xs,
-                fc2_dys,
-                fc2_dws,
-                [None] * num_groups,  # quantization_params
-                dtype,
-                layout="NT",
-                m_splits=split_sizes_cpu,
-                accumulate=accumulate_into_main_grad,
+            grouped_fc2_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
+                num_tensors=num_groups,
+                shape=[fc2_weight_shape] * num_groups,
+                quantizer=None,
+                device=device,
+                dtype=dtype,
             )
+            # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
+            general_grouped_gemm_for_grouped_tensor(
+                fc2_ctx.grouped_input,
+                grouped_fc2_dy,
+                grouped_fc2_wgrad,
+                layout="NT",
+                accumulate=False,
+            )
+            for group_idx in range(num_groups):
+                fc2_dws[group_idx] = grouped_fc2_wgrad.quantized_tensors[group_idx]
+                if accumulate_into_main_grad:
+                    weight_param = getattr(fc2_op, f"weight{group_idx}")
+                    weight_param.main_grad.add_(fc2_dws[group_idx])
 
             # Megatron-LM wgrad fusion
             # Note: Return dummy tensor for grad weight if needed.
@@ -314,13 +327,21 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         )
 
         # Clear FC2 input tensor if possible
-        clear_tensor_data(*fc2_xs)
+        if fc2_ctx.grouped_input is not None:
+            clear_tensor_data(
+                fc2_ctx.grouped_input.data,
+                fc2_ctx.grouped_input.columnwise_data,
+                fc2_ctx.grouped_input.scale_inv,
+                fc2_ctx.grouped_input.columnwise_scale_inv,
+            )
 
         # FC1 dgrad GEMM
         grad_input = None
         if fc1_ctx.input_requires_grad:
 
             # Quantize weights to MXFP8 if needed
+            for quantizer in fc1_ctx.weight_quantizers:
+                quantizer.optimize_for_gemm = True
             if not is_quantized_tensor(fc1_ws[0]):
                 for quantizer in fc1_ctx.weight_quantizers:
                     quantizer.set_usage(rowwise=False, columnwise=True)
@@ -329,15 +350,26 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             # Launch GEMM
             in_shape = out_shape[:-1] + [fc1_weight_shape[1]]
             grad_input = torch.empty(in_shape, dtype=dtype, device=device)
-            general_grouped_gemm(
+            grouped_fc1_w = make_grouped_tensor_from_mxfp8_weights(
                 fc1_ws,
-                fc1_dys,
-                [grad_input],
-                [None] * num_groups,  # quantization_params
+                fc1_ctx.weight_quantizers[0],
+                device,
                 dtype,
+                with_gemm_swizzled_scales=True,
+            )
+            grouped_grad_input = make_grouped_tensor_from_buffers(
+                num_groups=num_groups,
+                data=grad_input,
+                split_sizes=split_sizes,
+                dtype=grad_input.dtype,
+                logical_last_dim=fc1_weight_shape[1],
+            )
+            general_grouped_gemm_for_grouped_tensor(
+                grouped_fc1_w,
+                grouped_fc1_dy,
+                grouped_grad_input,
                 layout="NN",
-                m_splits=split_sizes_cpu,
-                single_output=True,
+                accumulate=False,
             )
 
         # FC1 wgrad GEMM
@@ -365,16 +397,26 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 ]
 
             # Launch GEMM
-            general_grouped_gemm(
-                fc1_xs,
-                fc1_dys,
-                fc1_dws,
-                [None] * num_groups,  # quantization_params
-                dtype,
-                layout="NT",
-                m_splits=split_sizes_cpu,
-                accumulate=accumulate_into_main_grad,
+            grouped_fc1_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
+                num_tensors=num_groups,
+                shape=[fc1_weight_shape] * num_groups,
+                quantizer=None,
+                device=device,
+                dtype=dtype,
             )
+
+            general_grouped_gemm_for_grouped_tensor(
+                fc1_ctx.grouped_input,
+                grouped_fc1_dy,
+                grouped_fc1_wgrad,
+                layout="NT",
+                accumulate=False,
+            )
+            for group_idx in range(num_groups):
+                fc1_dws[group_idx] = grouped_fc1_wgrad.quantized_tensors[group_idx]
+                if accumulate_into_main_grad:
+                    weight_param = getattr(fc1_op, f"weight{group_idx}")
+                    weight_param.main_grad.add_(fc1_dws[group_idx])
 
             # Megatron-LM wgrad fusion
             # Note: Return dummy tensor for grad weight if needed.
@@ -390,7 +432,13 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         )
 
         # Clear FC1 input tensor if possible
-        clear_tensor_data(*fc1_xs)
+        if fc1_ctx.grouped_input is not None:
+            clear_tensor_data(
+                fc1_ctx.grouped_input.data,
+                fc1_ctx.grouped_input.columnwise_data,
+                fc1_ctx.grouped_input.scale_inv,
+                fc1_ctx.grouped_input.columnwise_scale_inv,
+            )
 
         return grad_input, [fc1_dws, (), fc2_dws], [(None,), (grad_scales,), (None,)]
 

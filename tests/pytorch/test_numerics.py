@@ -46,7 +46,12 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
-from transformer_engine.pytorch.cpp_extensions import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.cpp_extensions import (
+    general_gemm,
+    general_grouped_gemm,
+    general_grouped_gemm_for_grouped_tensor,
+)
+from transformer_engine.pytorch.tensor.storage.grouped_tensor import GroupedTensor
 from transformer_engine.common import recipe
 import transformer_engine_torch as tex
 from utils import ModelConfig, reset_rng_states
@@ -2702,6 +2707,236 @@ def test_transformer_layer_hidden_states_format(dtype, bs, model):
             y_bshd,
             y_thd.reshape(bs, config.max_seqlen_q, config.hidden_size).contiguous(),
         )
+
+
+def _pack_grouped_tensor(grouped_tensor: GroupedTensor, tensors: List[torch.Tensor]) -> None:
+    offset = 0
+    for tensor in tensors:
+        numel = tensor.numel()
+        grouped_tensor.data[offset : offset + numel].copy_(tensor.reshape(-1))
+        offset += numel
+
+
+def _make_grouped_tensor_from_splits(
+    m_sizes: List[int],
+    last_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> GroupedTensor:
+    first_dims = torch.tensor(m_sizes, device=device, dtype=torch.int64)
+    return GroupedTensor.make_grouped_tensor(
+        num_tensors=len(m_sizes),
+        first_dims=first_dims,
+        last_dims=None,
+        logical_first_dim=sum(m_sizes),
+        logical_last_dim=last_dim,
+        quantizer=None,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _make_grouped_tensor_uniform(
+    num_tensors: int,
+    first_dim: int,
+    last_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> GroupedTensor:
+    return GroupedTensor.make_grouped_tensor(
+        num_tensors=num_tensors,
+        first_dims=None,
+        last_dims=None,
+        logical_first_dim=num_tensors * first_dim,
+        logical_last_dim=last_dim,
+        quantizer=None,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _make_mxfp8_quantizer(*, is_a: bool, transposed: bool) -> MXFP8Quantizer:
+    if is_a:
+        rowwise = transposed
+        columnwise = not transposed
+    else:
+        rowwise = not transposed
+        columnwise = transposed
+    quantizer = MXFP8Quantizer(
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        rowwise=rowwise,
+        columnwise=columnwise,
+    )
+    quantizer.optimize_for_gemm = True
+    return quantizer
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("accumulate", [False])
+def test_grouped_gemm_grouped_tensor(layout, accumulate):
+    if tex.get_cublasLt_version() < 130200:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.2+.")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Grouped GEMM requires Blackwell (SM100) or newer.")
+    if not is_bf16_available():
+        pytest.skip("bfloat16 is required for grouped GEMM test.")
+
+    torch.manual_seed(0)
+    z, m, k, n = (4, 512, 256, 256)
+
+    split_points = torch.randperm(m - 1)[: z - 1] + 1
+    split_points = torch.sort(split_points).values.tolist()
+    m_sizes = [split_points[0]]
+    m_sizes += [b - a for a, b in zip(split_points[:-1], split_points[1:])]
+    m_sizes.append(m - split_points[-1])
+    assert sum(m_sizes) == m and len(m_sizes) == z
+
+    dtype = torch.bfloat16
+
+    if layout == "TN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        out = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # output
+        grad = False
+
+    elif layout == "NN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # dgrad
+        grad = True
+    else:  # layout == "NT"
+        A = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # wgrad
+        grad = True
+
+    out_ref = [o.clone() for o in out]
+    general_grouped_gemm(
+        A,
+        B,
+        out_ref,
+        [None] * z,
+        dtype,
+        m_splits=m_sizes,
+        grad=grad,
+        accumulate=accumulate,
+        layout=layout,
+        single_output=False,
+    )
+
+    device = A[0].device
+
+    if layout == "TN":
+        grouped_A = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+        grouped_B = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+        grouped_out = _make_grouped_tensor_from_splits(m_sizes, n, device, dtype)
+    elif layout == "NN":
+        grouped_A = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+        grouped_B = _make_grouped_tensor_from_splits(m_sizes, n, device, dtype)
+        grouped_out = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+    else:  # layout == "NT"
+        grouped_A = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+        grouped_B = _make_grouped_tensor_from_splits(m_sizes, n, device, dtype)
+        grouped_out = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+    _pack_grouped_tensor(grouped_A, A)
+    _pack_grouped_tensor(grouped_B, B)
+    _pack_grouped_tensor(grouped_out, out)
+
+    general_grouped_gemm_for_grouped_tensor(
+        grouped_A,
+        grouped_B,
+        grouped_out,
+        layout=layout,
+        accumulate=accumulate,
+    )
+
+    out_grouped = grouped_out.split_into_quantized_tensors()
+    tols = dtype_tols(dtype)
+    for o, o_ref in zip(out_grouped, out_ref):
+        torch.testing.assert_close(o, o_ref, **tols)
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+def test_grouped_gemm_grouped_tensor_mxfp8(layout: str) -> None:
+    torch.manual_seed(0)
+    z = 3
+    m_sizes = [512, 512, 512]
+    n, k = 512, 512
+    dtype = torch.float16
+
+    if layout == "TN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        out = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # output
+        grad = False
+    elif layout == "NN":
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # weight
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # dgrad
+        grad = True
+    else:  # layout == "NT"
+        A = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+        B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+        out = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # wgrad
+        grad = True
+
+    out_ref = [o.clone() for o in out]
+
+    transa = layout[0] == "T"
+    transb = layout[1] == "T"
+    a_quantizer = _make_mxfp8_quantizer(is_a=True, transposed=transa)
+    b_quantizer = _make_mxfp8_quantizer(is_a=False, transposed=transb)
+
+    grouped_A = GroupedTensor.create_and_quantize(
+        tensors=A,
+        quantizer=a_quantizer,
+        device="cuda",
+        dtype=dtype,
+    )
+    grouped_B = GroupedTensor.create_and_quantize(
+        tensors=B,
+        quantizer=b_quantizer,
+        device="cuda",
+        dtype=dtype,
+    )
+    A_fp8 = grouped_A.split_into_quantized_tensors()
+    B_fp8 = grouped_B.split_into_quantized_tensors()
+
+    general_grouped_gemm(
+        A_fp8,
+        B_fp8,
+        out_ref,
+        [None] * z,
+        dtype,
+        m_splits=m_sizes,
+        grad=grad,
+        accumulate=False,
+        layout=layout,
+        single_output=False,
+    )
+
+    device = A[0].device
+
+    if layout == "TN":
+        grouped_out = _make_grouped_tensor_from_splits(m_sizes, n, device, dtype)
+    elif layout == "NN":
+        grouped_out = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+    else:  # layout == "NT"
+        grouped_out = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+
+    _pack_grouped_tensor(grouped_out, out)
+    general_grouped_gemm_for_grouped_tensor(
+        grouped_A,
+        grouped_B,
+        grouped_out,
+        layout=layout,
+        accumulate=False,
+    )
+
+    out_grouped = grouped_out.split_into_quantized_tensors()
+    tols = dtype_tols(dtype)
+    for o, o_ref in zip(out_grouped, out_ref):
+        torch.testing.assert_close(o, o_ref, **tols)
 
 
 @pytest.mark.parametrize(

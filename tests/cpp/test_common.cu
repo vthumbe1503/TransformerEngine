@@ -1170,8 +1170,12 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
     nvte_set_grouped_tensor_param(&h, kNVTEGroupedRowwiseData, &data_tensor);
   }
 
-  // Copy columnwise data if available
-  if (has_columnwise) {
+  NVTEBasicTensor data_tensor{grouped.data.get(), static_cast<NVTEDType>(dtype), grouped.logical_shape};
+  NVTEGroupedTensor h = grouped.handle.get();
+  nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseData, &data_tensor, sizeof(data_tensor));
+
+  const bool include_columnwise = isFp8Type(dtype) || isFp4Type(dtype);
+  if (include_columnwise) {
     grouped.columnwise_data = cuda_alloc(total_bytes);
     for (size_t i = 0; i < num_tensors; ++i) {
       const size_t offset_bytes = static_cast<size_t>(offsets[i]) * elem_size;
@@ -1183,7 +1187,7 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
     NVTEBasicTensor col_tensor{grouped.columnwise_data.get(),
                                static_cast<NVTEDType>(dtype),
                                grouped.logical_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedColumnwiseData, &col_tensor);
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedColumnwiseData, &col_tensor, sizeof(col_tensor));
   }
 
   if (!same_first) {
@@ -1192,7 +1196,7 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                num_tensors * sizeof(int64_t), cudaMemcpyHostToDevice));
     NVTEShape fd_shape = nvte_make_shape(&num_tensors, 1);
     NVTEBasicTensor fd_tensor{grouped.first_dims_dev.get(), kNVTEInt64, fd_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedFirstDims, &fd_tensor);
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedFirstDims, &fd_tensor, sizeof(fd_tensor));
   }
 
   if (!same_last) {
@@ -1201,7 +1205,7 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                num_tensors * sizeof(int64_t), cudaMemcpyHostToDevice));
     NVTEShape ld_shape = nvte_make_shape(&num_tensors, 1);
     NVTEBasicTensor ld_tensor{grouped.last_dims_dev.get(), kNVTEInt64, ld_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedLastDims, &ld_tensor);
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedLastDims, &ld_tensor, sizeof(ld_tensor));
   }
 
   if (!same_first || !same_last) {
@@ -1210,7 +1214,7 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                num_tensors * sizeof(int64_t), cudaMemcpyHostToDevice));
     NVTEShape off_shape = nvte_make_shape(&num_tensors, 1);
     NVTEBasicTensor off_tensor{grouped.offsets_dev.get(), kNVTEInt64, off_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedTensorOffsets, &off_tensor);
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedTensorOffsets, &off_tensor, sizeof(off_tensor));
   }
 
   if (isFp8Type(dtype) && scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
