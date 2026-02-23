@@ -1234,7 +1234,6 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                sizeof(float) * num_tensors, cudaMemcpyHostToDevice));
     NVTEShape scale_shape = nvte_make_shape(&num_tensors, 1);
     NVTEBasicTensor scale_tensor{grouped.scale_inv.get(), kNVTEFloat32, scale_shape};
-<<<<<<< HEAD
     nvte_set_grouped_tensor_param(&h, kNVTEGroupedRowwiseScaleInv, &scale_tensor);
     nvte_set_grouped_tensor_param(&h, kNVTEGroupedColumnwiseScaleInv, &scale_tensor);
   } else if (scaling_mode == NVTE_MXFP8_1D_SCALING) {
@@ -1297,12 +1296,6 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
 
     // Mark as having swizzled scales (required for GEMM)
     nvte_set_grouped_tensor_swizzled_scales(h, 1);
-=======
-    nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseScaleInv, &scale_tensor,
-                                  sizeof(scale_tensor));
-    nvte_set_grouped_tensor_param(h, kNVTEGroupedColumnwiseScaleInv, &scale_tensor,
-                                  sizeof(scale_tensor));
->>>>>>> ksivaman/grouped_tensor_python
   }
 
   return grouped;
