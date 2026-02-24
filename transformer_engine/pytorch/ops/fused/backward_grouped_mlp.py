@@ -131,7 +131,11 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
 
         # Saved tensors from FC1 forward
         saved_tensors = fc1_ctx.saved_tensors
-        split_sizes, saved_tensors = saved_tensors[0], saved_tensors[1:]
+        split_sizes, split_points, saved_tensors = (
+            saved_tensors[0],
+            saved_tensors[1],
+            saved_tensors[2:],
+        )
         fc1_ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
         (
             fc1_x_data,
@@ -160,7 +164,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         if int(split_sizes.numel()) != num_groups:
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
-        split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
+        split_points = split_points.to(dtype=torch.int, device=device)
 
         grouped_fc1_x = None
         if fc1_ctx.weight_requires_grad:

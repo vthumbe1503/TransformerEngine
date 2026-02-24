@@ -359,7 +359,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             else:
                 fc1_input_tensors = (None, None, None, None, None)
             # FC1
-            fc1_ctx.save_for_backward(split_sizes, *fc1_ws, *fc1_input_tensors)
+            fc1_ctx.save_for_backward(split_sizes, split_points, *fc1_ws, *fc1_input_tensors)
             fc1_ctx.with_quantized_compute = True
             fc1_ctx.input_quantizers = fc1_input_quantizers
             fc1_ctx.weight_quantizers = fc1_weight_quantizers
