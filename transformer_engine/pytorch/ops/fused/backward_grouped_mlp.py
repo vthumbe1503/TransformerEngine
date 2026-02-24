@@ -14,6 +14,7 @@ from typing import Optional
 import torch
 
 import transformer_engine_torch as tex
+from cuda.bindings import driver as cuda
 from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor, general_grouped_gemm
 from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
@@ -72,6 +73,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc2: GroupedLinear,
     ) -> None:
         super().__init__((fc1, swiglu, fc2))
+        self._mxfp8_alpha_tensor: Optional[torch.Tensor] = None
+        self._mxfp8_norm_const_tensor: Optional[torch.Tensor] = None
 
         # Check for unsupported configurations
         if not self.is_supported():
@@ -130,6 +133,13 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         saved_tensors = fc1_ctx.saved_tensors
         split_sizes, saved_tensors = saved_tensors[0], saved_tensors[1:]
         fc1_ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
+        (
+            fc1_x_data,
+            fc1_x_col_data,
+            fc1_x_scale,
+            fc1_x_col_scale,
+            fc1_x_tensor_offsets,
+        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
 
         # Saved tensors from scaled SwiGLU forward
         swiglu_in, scales = swiglu_ctx.saved_tensors
@@ -138,12 +148,51 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         saved_tensors = fc2_ctx.saved_tensors
         _, saved_tensors = saved_tensors[0], saved_tensors[1:]  # Assume same split sizes as FC1
         fc2_ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
+        (
+            fc2_x_data,
+            fc2_x_col_data,
+            fc2_x_scale,
+            fc2_x_col_scale,
+            fc2_x_tensor_offsets,
+        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
 
         # Group splits
         if int(split_sizes.numel()) != num_groups:
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
+
+        grouped_fc1_x = None
+        if fc1_ctx.weight_requires_grad:
+            grouped_fc1_x = make_grouped_tensor_from_buffers(
+                num_groups=num_groups,
+                data=fc1_x_data,
+                columnwise_data=fc1_x_col_data,
+                scale_inv=fc1_x_scale,
+                columnwise_scale_inv=fc1_x_col_scale,
+                split_sizes=split_sizes,
+                logical_last_dim=fc1_weight_shape[1],
+                dtype=dtype,
+                quantizer=fc1_ctx.input_quantizers[0],
+                with_gemm_swizzled_scales=True,
+                tensor_offsets=fc1_x_tensor_offsets,
+            )
+
+        grouped_fc2_x = None
+        if fc2_ctx.weight_requires_grad:
+            grouped_fc2_x = make_grouped_tensor_from_buffers(
+                num_groups=num_groups,
+                data=fc2_x_data,
+                columnwise_data=fc2_x_col_data,
+                scale_inv=fc2_x_scale,
+                columnwise_scale_inv=fc2_x_col_scale,
+                split_sizes=split_sizes,
+                logical_last_dim=fc2_weight_shape[1],
+                dtype=dtype,
+                quantizer=fc2_ctx.input_quantizers[0],
+                with_gemm_swizzled_scales=True,
+                tensor_offsets=fc2_x_tensor_offsets,
+            )
 
         # Split grad output tensor and convert dtypes if needed
         fc2_dy = maybe_dequantize(grad_output, dtype)
@@ -207,7 +256,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc2_w_scales = fc2_w_scales.permute(3, 4, 1, 5, 2, 0)
 
         # Kernel scaling factors
-        ones = torch.ones(num_groups, dtype=dtype, device=device)
+        alpha_tensor, norm_const_tensor = self._get_kernel_constants(
+            num_groups=num_groups, dtype=dtype, device=device
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Fused kernel for FC2 dgrad + dSwiGLU + grad scale
         fc2_dgrad_kernel_out = self.grouped_gemm_dswiglu_kernel()(
@@ -217,13 +269,14 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc2_dy_scales,
             fc2_w_scales,
             split_points,
-            ones,  # alpha_tensor
-            ones,  # beta_tensor
+            alpha_tensor,  # alpha_tensor
+            alpha_tensor,  # beta_tensor
             scales.detach().to(dtype=torch.float32).reshape(-1, 1, 1),
-            norm_const_tensor=ones[:1],
+            norm_const_tensor=norm_const_tensor,
             d_dtype=torch.float8_e4m3fn,
             cd_major="n",
             sf_vec_size=32,
+            current_stream=current_stream,
         )
 
         # Unpack kernel outputs
@@ -301,7 +354,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             )
             # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
             general_grouped_gemm_for_grouped_tensor(
-                fc2_ctx.grouped_input,
+                grouped_fc2_x,
                 grouped_fc2_dy,
                 grouped_fc2_wgrad,
                 layout="NT",
@@ -327,12 +380,12 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         )
 
         # Clear FC2 input tensor if possible
-        if fc2_ctx.grouped_input is not None:
+        if grouped_fc2_x is not None:
             clear_tensor_data(
-                fc2_ctx.grouped_input.data,
-                fc2_ctx.grouped_input.columnwise_data,
-                fc2_ctx.grouped_input.scale_inv,
-                fc2_ctx.grouped_input.columnwise_scale_inv,
+                grouped_fc2_x.data,
+                grouped_fc2_x.columnwise_data,
+                grouped_fc2_x.scale_inv,
+                grouped_fc2_x.columnwise_scale_inv,
             )
 
         # FC1 dgrad GEMM
@@ -406,7 +459,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             )
 
             general_grouped_gemm_for_grouped_tensor(
-                fc1_ctx.grouped_input,
+                grouped_fc1_x,
                 grouped_fc1_dy,
                 grouped_fc1_wgrad,
                 layout="NT",
@@ -432,15 +485,37 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         )
 
         # Clear FC1 input tensor if possible
-        if fc1_ctx.grouped_input is not None:
+        if grouped_fc1_x is not None:
             clear_tensor_data(
-                fc1_ctx.grouped_input.data,
-                fc1_ctx.grouped_input.columnwise_data,
-                fc1_ctx.grouped_input.scale_inv,
-                fc1_ctx.grouped_input.columnwise_scale_inv,
+                grouped_fc1_x.data,
+                grouped_fc1_x.columnwise_data,
+                grouped_fc1_x.scale_inv,
+                grouped_fc1_x.columnwise_scale_inv,
             )
 
         return grad_input, [fc1_dws, (), fc2_dws], [(None,), (grad_scales,), (None,)]
+
+    def _get_kernel_constants(
+        self,
+        *,
+        num_groups: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        alpha_tensor = self._mxfp8_alpha_tensor
+        norm_const_tensor = self._mxfp8_norm_const_tensor
+        if (
+            alpha_tensor is None
+            or alpha_tensor.numel() != num_groups
+            or alpha_tensor.dtype != dtype
+            or alpha_tensor.device != device
+        ):
+            alpha_tensor = torch.ones(num_groups, dtype=dtype, device=device)
+            norm_const_tensor = alpha_tensor[:1]
+            self._mxfp8_alpha_tensor = alpha_tensor
+            self._mxfp8_norm_const_tensor = norm_const_tensor
+
+        return alpha_tensor, norm_const_tensor
 
 
 def fuse_backward_ops(
