@@ -73,6 +73,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc2: GroupedLinear,
     ) -> None:
         super().__init__((fc1, swiglu, fc2))
+        self._mxfp8_alpha_tensor: Optional[torch.Tensor] = None
+        self._mxfp8_norm_const_tensor: Optional[torch.Tensor] = None
 
         # Check for unsupported configurations
         if not self.is_supported():
@@ -254,7 +256,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc2_w_scales = fc2_w_scales.permute(3, 4, 1, 5, 2, 0)
 
         # Kernel scaling factors
-        ones = torch.ones(num_groups, dtype=dtype, device=device)
+        alpha_tensor, norm_const_tensor = self._get_kernel_constants(
+            num_groups=num_groups, dtype=dtype, device=device
+        )
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Fused kernel for FC2 dgrad + dSwiGLU + grad scale
@@ -265,10 +269,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc2_dy_scales,
             fc2_w_scales,
             split_points,
-            ones,  # alpha_tensor
-            ones,  # beta_tensor
+            alpha_tensor,  # alpha_tensor
+            alpha_tensor,  # beta_tensor
             scales.detach().to(dtype=torch.float32).reshape(-1, 1, 1),
-            norm_const_tensor=ones[:1],
+            norm_const_tensor=norm_const_tensor,
             d_dtype=torch.float8_e4m3fn,
             cd_major="n",
             sf_vec_size=32,
@@ -490,6 +494,28 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             )
 
         return grad_input, [fc1_dws, (), fc2_dws], [(None,), (grad_scales,), (None,)]
+
+    def _get_kernel_constants(
+        self,
+        *,
+        num_groups: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        alpha_tensor = self._mxfp8_alpha_tensor
+        norm_const_tensor = self._mxfp8_norm_const_tensor
+        if (
+            alpha_tensor is None
+            or alpha_tensor.numel() != num_groups
+            or alpha_tensor.dtype != dtype
+            or alpha_tensor.device != device
+        ):
+            alpha_tensor = torch.ones(num_groups, dtype=dtype, device=device)
+            norm_const_tensor = alpha_tensor[:1]
+            self._mxfp8_alpha_tensor = alpha_tensor
+            self._mxfp8_norm_const_tensor = norm_const_tensor
+
+        return alpha_tensor, norm_const_tensor
 
 
 def fuse_backward_ops(

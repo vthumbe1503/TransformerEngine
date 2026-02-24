@@ -72,6 +72,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2: GroupedLinear,
     ) -> None:
         super().__init__((fc1, swiglu, fc2))
+        self._mxfp8_alpha_tensor: Optional[torch.Tensor] = None
+        self._mxfp8_norm_const_tensor: Optional[torch.Tensor] = None
         # Check for unsupported configurations
         if not self.is_supported():
             self.grouped_gemm_swiglu_kernel()  # Try triggering import error
@@ -241,7 +243,9 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc1_w_scales = fc1_w_scales.permute(3, 4, 1, 5, 2, 0)
 
         # Kernel scaling factors
-        ones = torch.ones(num_groups, dtype=dtype, device=device)
+        alpha_tensor, norm_const_tensor = self._get_kernel_constants(
+            num_groups=num_groups, dtype=dtype, device=device
+        )
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Fused kernel for FC1 + SwiGLU + post-scale
@@ -251,8 +255,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc1_x_scales,
             fc1_w_scales,
             split_points,
-            ones,  # alpha_tensor
-            norm_const_tensor=ones[:1],
+            alpha_tensor,  # alpha_tensor
+            norm_const_tensor=norm_const_tensor,
             prob_tensor=scales.detach().reshape(-1, 1, 1),
             acc_dtype=torch.float32,
             c_dtype=torch.bfloat16,
@@ -393,6 +397,35 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc2_ctx.weight_requires_grad = weight_requires_grad
 
         return fc2_out, [(), (), ()]
+
+    def _get_kernel_constants(
+        self,
+        *,
+        num_groups: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        alpha_tensor = self._mxfp8_alpha_tensor
+        norm_const_tensor = self._mxfp8_norm_const_tensor
+        if (
+            alpha_tensor is None
+            or alpha_tensor.numel() != num_groups
+            or alpha_tensor.dtype != dtype
+            or alpha_tensor.device != device
+        ):
+            alpha_tensor = torch.ones(num_groups, dtype=dtype, device=device)
+            norm_const_tensor = alpha_tensor[:1]
+            self._mxfp8_alpha_tensor = alpha_tensor
+            self._mxfp8_norm_const_tensor = norm_const_tensor
+        elif (
+            norm_const_tensor is None
+            or norm_const_tensor.numel() != 1
+            or norm_const_tensor.dtype != dtype
+            or norm_const_tensor.device != device
+        ):
+            norm_const_tensor = alpha_tensor[:1]
+            self._mxfp8_norm_const_tensor = norm_const_tensor
+        return alpha_tensor, norm_const_tensor
 
 
 def fuse_forward_ops(
