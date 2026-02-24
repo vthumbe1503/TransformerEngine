@@ -13,11 +13,14 @@ from typing import Any, Optional
 import torch
 
 import transformer_engine_torch as tex
+from cuda.bindings import driver as cuda
 from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor
 from ...module._common import noop_cat
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...utils import get_device_compute_capability
+from ...tensor.storage.grouped_tensor import GroupedTensor
+from ...constants import MXFP8_BLOCK_SCALING_SIZE
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_forward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
@@ -161,6 +164,12 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
+        fc1_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
+            split_sizes, fc1_weight_shape[1]
+        )
+        fc2_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
+            split_sizes, fc2_weight_shape[1]
+        )
 
         # Extract post-scales from extra input
         scales = basic_op_extra_inputs[1][0]
@@ -233,6 +242,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
 
         # Kernel scaling factors
         ones = torch.ones(num_groups, dtype=dtype, device=device)
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Fused kernel for FC1 + SwiGLU + post-scale
         fc1_kernel_out = self.grouped_gemm_swiglu_kernel()(
@@ -248,7 +258,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             c_dtype=torch.bfloat16,
             d_dtype=torch.float8_e4m3fn,
             cd_major="n",
-            sf_vec_size=32,
+            sf_vec_size=MXFP8_BLOCK_SCALING_SIZE,
+            current_stream=current_stream,
         )
 
         # Unpack kernel outputs
@@ -295,7 +306,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             logical_last_dim=fc2_weight_shape[1],
             dtype=dtype,
             quantizer=fc2_input_quantizers[0],
-            with_gemm_swizzled_scales=True
+            with_gemm_swizzled_scales=True,
+            tensor_offsets=fc2_x_tensor_offsets,
         )
 
         # FC2 GEMM 
@@ -332,8 +344,18 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
 
         # Save state for backward pass
         if requires_grad:
+            if grouped_fc1_x is not None:
+                fc1_input_tensors = (
+                    grouped_fc1_x.data,
+                    grouped_fc1_x.columnwise_data,
+                    grouped_fc1_x.scale_inv,
+                    grouped_fc1_x.columnwise_scale_inv,
+                    fc1_x_tensor_offsets,
+                )
+            else:
+                fc1_input_tensors = (None, None, None, None, None)
             # FC1
-            fc1_ctx.save_for_backward(split_sizes, *fc1_ws)
+            fc1_ctx.save_for_backward(split_sizes, *fc1_ws, *fc1_input_tensors)
             fc1_ctx.with_quantized_compute = True
             fc1_ctx.input_quantizers = fc1_input_quantizers
             fc1_ctx.weight_quantizers = fc1_weight_quantizers
@@ -342,7 +364,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc1_ctx.dtype = dtype
             fc1_ctx.input_requires_grad = input_requires_grad
             fc1_ctx.weight_requires_grad = weight_requires_grad
-            fc1_ctx.grouped_input = grouped_fc1_x
 
             # Scaled SwiGLU
             swiglu_ctx.save_for_backward(swiglu_in, scales)
@@ -351,7 +372,17 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             swiglu_ctx.dtype = dtype
 
             # FC2 state
-            fc2_ctx.save_for_backward(split_sizes, *fc2_ws)
+            if grouped_fc2_x is not None:
+                fc2_input_tensors = (
+                    grouped_fc2_x.data,
+                    grouped_fc2_x.columnwise_data,
+                    grouped_fc2_x.scale_inv,
+                    grouped_fc2_x.columnwise_scale_inv,
+                    fc2_x_tensor_offsets,
+                )
+            else:
+                fc2_input_tensors = (None, None, None, None, None)
+            fc2_ctx.save_for_backward(split_sizes, *fc2_ws, *fc2_input_tensors)
             fc2_ctx.with_quantized_compute = True
             fc2_ctx.input_quantizers = fc2_input_quantizers
             fc2_ctx.weight_quantizers = fc2_weight_quantizers
@@ -360,7 +391,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc2_ctx.dtype = dtype
             fc2_ctx.input_requires_grad = input_requires_grad
             fc2_ctx.weight_requires_grad = weight_requires_grad
-            fc2_ctx.grouped_input = grouped_fc2_x
 
         return fc2_out, [(), (), ()]
 

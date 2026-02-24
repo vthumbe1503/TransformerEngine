@@ -85,6 +85,7 @@ def make_grouped_tensor_from_buffers(
     columnwise_data: torch.Tensor=None,
     scale_inv: torch.Tensor=None,
     columnwise_scale_inv: torch.Tensor=None,
+    tensor_offsets: torch.Tensor=None,
     logical_last_dim: int,
     dtype: torch.dtype,
     quantizer: Quantizer=None,
@@ -94,6 +95,9 @@ def make_grouped_tensor_from_buffers(
 
     Scales are already in GEMM swizzled layout.
     """
+    if tensor_offsets is None:
+        tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, logical_last_dim)
+
     return GroupedTensor(
         num_tensors=num_groups,
         shape=None,
@@ -108,7 +112,7 @@ def make_grouped_tensor_from_buffers(
         scale=None,
         first_dims=split_sizes,
         last_dims=None,
-        tensor_offsets=GroupedTensor.make_tensor_offsets(split_sizes, logical_last_dim),
+        tensor_offsets=tensor_offsets,
         offsets=None,
         scale_inv_offsets=None,
         columnwise_scale_inv_offsets=None,
