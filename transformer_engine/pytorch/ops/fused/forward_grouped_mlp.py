@@ -30,9 +30,7 @@ from .._common import (
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
-from transformer_engine.common.triton.triton_repack import (
-    triton_repack_for_split_by_dim2_concat_along_dim0,
-)
+
 
 
 class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
@@ -264,6 +262,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             cd_major="n",
             sf_vec_size=MXFP8_BLOCK_SCALING_SIZE,
             current_stream=current_stream,
+            discrete_col_sfd=True,
         )
 
         # Unpack kernel outputs
@@ -283,29 +282,21 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2_in_row_data = fc2_in_row_data.view(in_shape[0], fc2_weight_shape[1]).contiguous()
         fc2_in_row_scale = fc1_kernel_out["sfd_row_tensor"]
         fc2_in_row_scale = fc2_in_row_scale.permute(5, 2, 4, 0, 1, 3)
-        fc2_in_row_scale = fc2_in_row_scale.view(
-            in_shape[0], fc2_weight_shape[1] // 32
-        )
+
         fc2_in_col_data = fc1_kernel_out["d_col_tensor"]
         fc2_in_col_data = fc2_in_col_data.permute(2, 0, 1)
         fc2_in_col_data = fc2_in_col_data.view(in_shape[0], fc2_weight_shape[1]).contiguous()
         fc2_in_col_scale = fc1_kernel_out["sfd_col_tensor"]
         fc2_in_col_scale = fc2_in_col_scale.permute(5, 2, 4, 0, 1, 3)
         # Repack columnwise scales on GPU to preserve group ordering.
-        fc2_in_col_scale = triton_repack_for_split_by_dim2_concat_along_dim0(
-            fc2_in_col_scale,
-            split_sizes/128,
-            fc2_weight_shape[1],
-            in_shape[0] // 32,
-        )
 
         # FC2 inputs scales are already swizzled/optimized for GEMM
         grouped_fc2_x = make_grouped_tensor_from_buffers(
             num_groups=num_groups,
-            data=fc2_in_row_data,
-            columnwise_data=fc2_in_col_data,
-            scale_inv=fc2_in_row_scale,
-            columnwise_scale_inv=fc2_in_col_scale,
+            data=fc2_in_row_data.reshape(-1),
+            columnwise_data=fc2_in_col_data.reshape(-1),
+            scale_inv=fc2_in_row_scale.reshape(-1),
+            columnwise_scale_inv=fc2_in_col_scale.reshape(-1),
             split_sizes=split_sizes,
             logical_last_dim=fc2_weight_shape[1],
             dtype=dtype,
@@ -350,11 +341,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         if requires_grad:
             if grouped_fc1_x is not None:
                 fc1_input_tensors = (
-                    grouped_fc1_x.data,
-                    grouped_fc1_x.columnwise_data,
-                    grouped_fc1_x.scale_inv,
-                    grouped_fc1_x.columnwise_scale_inv,
-                    fc1_x_tensor_offsets,
+                    None, # data
+                    grouped_fc1_x.columnwise_data, # columnwise_data
+                    None, # scale_inv
+                    grouped_fc1_x.columnwise_scale_inv, # columnwise_scale_inv
+                    fc1_x_tensor_offsets, # tensor_offsets
                 )
             else:
                 fc1_input_tensors = (None, None, None, None, None)
@@ -378,11 +369,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             # FC2 state
             if grouped_fc2_x is not None:
                 fc2_input_tensors = (
-                    grouped_fc2_x.data,
-                    grouped_fc2_x.columnwise_data,
-                    grouped_fc2_x.scale_inv,
-                    grouped_fc2_x.columnwise_scale_inv,
-                    fc2_x_tensor_offsets,
+                    None, # data
+                    grouped_fc2_x.columnwise_data, # columnwise_data
+                    None, # scale_inv
+                    grouped_fc2_x.columnwise_scale_inv, # columnwise_scale_inv
+                    fc2_x_tensor_offsets, # tensor_offsets
                 )
             else:
                 fc2_input_tensors = (None, None, None, None, None)

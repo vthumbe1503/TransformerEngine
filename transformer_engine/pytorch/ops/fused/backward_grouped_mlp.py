@@ -31,9 +31,7 @@ from .._common import (
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
-from transformer_engine.common.triton.triton_repack import (
-    triton_repack_for_split_by_dim2_concat_along_dim0,
-)
+
 
 
 class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
@@ -281,6 +279,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             cd_major="n",
             sf_vec_size=32,
             current_stream=current_stream,
+            discrete_col_sfd=True,
         )
 
         # Unpack kernel outputs
@@ -303,15 +302,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_col_scale = fc2_dgrad_kernel_out["sfd_col_tensor"]
         fc1_dy_col_scale = fc1_dy_col_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_col_scale = triton_repack_for_split_by_dim2_concat_along_dim0(
-            fc1_dy_col_scale,
-            split_sizes/128,
-            fc1_weight_shape[0],
-            out_shape[0] // 32,
-        )
+        fc1_dy_col_scale = fc1_dy_col_scale.reshape(-1)
 
-        # Column-wise scale for (m, n): shape (m/32, n)
-        fc1_dy_col_scale = fc1_dy_col_scale.contiguous().view(out_shape[0] // 32, fc1_weight_shape[0])
         grad_scales = fc2_dgrad_kernel_out["dprob_tensor"]
         grad_scales = grad_scales.view(-1).to(dtype=dtype)
 

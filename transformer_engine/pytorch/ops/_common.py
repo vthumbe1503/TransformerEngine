@@ -97,7 +97,7 @@ def make_grouped_tensor_from_buffers(
     """
     if tensor_offsets is None:
         tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, logical_last_dim)
-
+    logical_first_dim = data.shape[0] if data is not None else columnwise_data.shape[0]
     return GroupedTensor(
         num_tensors=num_groups,
         shape=None,
@@ -116,7 +116,7 @@ def make_grouped_tensor_from_buffers(
         offsets=None,
         scale_inv_offsets=None,
         columnwise_scale_inv_offsets=None,
-        logical_shape=(data.shape[0], logical_last_dim),
+        logical_shape=(logical_first_dim, logical_last_dim),
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
 
