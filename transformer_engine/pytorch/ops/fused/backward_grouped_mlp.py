@@ -15,7 +15,11 @@ import torch
 
 import transformer_engine_torch as tex
 from cuda.bindings import driver as cuda
-from ...cpp_extensions import general_grouped_gemm_for_grouped_tensor, general_grouped_gemm
+from ...cpp_extensions import (
+    general_grouped_gemm_for_grouped_tensor,
+    general_grouped_gemm_for_discrete_out,
+    general_grouped_gemm,
+)
 from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
 from ...quantization import Recipe
@@ -341,26 +345,33 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 )
 
             # Launch GEMM
-            grouped_fc2_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
-                num_tensors=num_groups,
-                shape=[fc2_weight_shape] * num_groups,
-                quantizer=None,
-                device=device,
-                dtype=dtype,
-            )
-            # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc2_x,
-                grouped_fc2_dy,
-                grouped_fc2_wgrad,
-                layout="NT",
-                accumulate=False,
-            )
-            for group_idx in range(num_groups):
-                fc2_dws[group_idx] = grouped_fc2_wgrad.quantized_tensors[group_idx]
-                if accumulate_into_main_grad:
-                    weight_param = getattr(fc2_op, f"weight{group_idx}")
-                    weight_param.main_grad.add_(fc2_dws[group_idx])
+            if accumulate_into_main_grad:
+                # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
+                general_grouped_gemm_for_discrete_out(
+                    grouped_fc2_x,
+                    grouped_fc2_dy,
+                    fc2_dws,
+                    layout="NT",
+                    accumulate=True,
+                )
+            else:
+                grouped_fc2_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
+                    num_tensors=num_groups,
+                    shape=[fc2_weight_shape] * num_groups,
+                    quantizer=None,
+                    device=device,
+                    dtype=dtype,
+                )
+                # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc2_x,
+                    grouped_fc2_dy,
+                    grouped_fc2_wgrad,
+                    layout="NT",
+                    accumulate=False,
+                )
+                for group_idx in range(num_groups):
+                    fc2_dws[group_idx] = grouped_fc2_wgrad.quantized_tensors[group_idx]
 
             # Megatron-LM wgrad fusion
             # Note: Return dummy tensor for grad weight if needed.
@@ -446,26 +457,32 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 ]
 
             # Launch GEMM
-            grouped_fc1_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
-                num_tensors=num_groups,
-                shape=[fc1_weight_shape] * num_groups,
-                quantizer=None,
-                device=device,
-                dtype=dtype,
-            )
+            if accumulate_into_main_grad:
+                general_grouped_gemm_for_discrete_out(
+                    grouped_fc1_x,
+                    grouped_fc1_dy,
+                    fc1_dws,
+                    layout="NT",
+                    accumulate=True,
+                )
+            else:
+                grouped_fc1_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
+                    num_tensors=num_groups,
+                    shape=[fc1_weight_shape] * num_groups,
+                    quantizer=None,
+                    device=device,
+                    dtype=dtype,
+                )
 
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc1_x,
-                grouped_fc1_dy,
-                grouped_fc1_wgrad,
-                layout="NT",
-                accumulate=False,
-            )
-            for group_idx in range(num_groups):
-                fc1_dws[group_idx] = grouped_fc1_wgrad.quantized_tensors[group_idx]
-                if accumulate_into_main_grad:
-                    weight_param = getattr(fc1_op, f"weight{group_idx}")
-                    weight_param.main_grad.add_(fc1_dws[group_idx])
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc1_x,
+                    grouped_fc1_dy,
+                    grouped_fc1_wgrad,
+                    layout="NT",
+                    accumulate=False,
+                )
+                for group_idx in range(num_groups):
+                    fc1_dws[group_idx] = grouped_fc1_wgrad.quantized_tensors[group_idx]
 
             # Megatron-LM wgrad fusion
             # Note: Return dummy tensor for grad weight if needed.
