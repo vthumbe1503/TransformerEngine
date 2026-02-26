@@ -98,6 +98,9 @@ def make_grouped_tensor_from_buffers(
     if tensor_offsets is None:
         tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, logical_last_dim)
     logical_first_dim = data.shape[0] if data is not None else columnwise_data.shape[0]
+    ndim = data.ndim if data is not None else columnwise_data.ndim
+    if ndim == 1:
+        logical_first_dim = logical_first_dim // logical_last_dim
     return GroupedTensor(
         num_tensors=num_groups,
         shape=None,
