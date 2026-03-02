@@ -101,7 +101,7 @@ def _run_fused_adam_test(test_name, recipe="delayed_scaling"):
 @pytest.mark.skipif(NUM_PROCS < 2, reason="Requires 2+ GPUs")
 def test_fsdp2_fused_adam_fp8_master_weights(fp_recipe):
     """FusedAdam(master_weights=True) + FSDP2 + quantized_model_init."""
-    if fp_recipe in ("Float8BlockScaling", "MXFP8BlockScaling", "NVFP4BlockScaling"):
+    if fp_recipe in ("Float8BlockScaling", "NVFP4BlockScaling"):
         pytest.xfail(
             f"{fp_recipe}: quantized_model_init and FSDP2 is not currently supported, since the "
             "block tensor is dequantized before we flatten it for FSDP2."
@@ -120,8 +120,7 @@ def test_fsdp2_fused_adam_fp8_no_master(fp_recipe):
     """FusedAdam(master_weights=False) + FSDP2 + FP8 params."""
     if fp_recipe == "MXFP8BlockScaling":
         pytest.xfail(
-            "MXFP8BlockScaling: FusedAdam CUDA kernel does not support "
-            "MXFP8 quantized tensors, causing illegal memory access"
+            "MXFP8BlockScaling: FusedAdam requires master_weights=True for MXFP8 params"
         )
     _run_fused_adam_test("fused_adam_fp8_no_master", fp_recipe)
 
@@ -135,11 +134,6 @@ def test_fsdp2_fused_adam_bf16_store_param_remainders(fp_recipe):
 @pytest.mark.skipif(NUM_PROCS < 2, reason="Requires 2+ GPUs")
 def test_fsdp2_dcp_output_parity(fp_recipe):
     """DCP save/load round-trip into a fresh model produces identical outputs."""
-    if fp_recipe == "MXFP8BlockScaling":
-        pytest.xfail(
-            "MXFP8BlockScaling: FusedAdam CUDA kernel does not support "
-            "MXFP8 quantized tensors, causing illegal memory access"
-        )
     _run_fused_adam_test("dcp_output_parity", fp_recipe)
 
 
@@ -152,22 +146,12 @@ def test_fsdp2_dcp_output_parity_async(fp_recipe):
             "the async staging may capture stale tensor state for FP8 scaling "
             "factors, causing numerical divergence after reload"
         )
-    if fp_recipe == "MXFP8BlockScaling":
-        pytest.xfail(
-            "MXFP8BlockScaling: FusedAdam CUDA kernel does not support "
-            "MXFP8 quantized tensors, causing illegal memory access"
-        )
     _run_fused_adam_test("dcp_output_parity_async", fp_recipe)
 
 
 @pytest.mark.skipif(NUM_PROCS < 2, reason="Requires 2+ GPUs")
 def test_fsdp2_safetensors_fp32_export(fp_recipe):
     """Export FP32 model from optimizer master weights to safetensors."""
-    if fp_recipe == "MXFP8BlockScaling":
-        pytest.xfail(
-            "MXFP8BlockScaling: FusedAdam CUDA kernel does not support "
-            "MXFP8 quantized tensors, causing illegal memory access"
-        )
     _run_fused_adam_test("safetensors_fp32_export", fp_recipe)
 
 

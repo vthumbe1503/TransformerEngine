@@ -14,6 +14,7 @@ import torch
 from torch.distributed._tensor import DTensor
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor, Float8Quantizer
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 from .multi_tensor_apply import multi_tensor_applier
 
@@ -189,6 +190,7 @@ class FusedAdam(torch.optim.Optimizer):
         self.multi_tensor_adam = tex.multi_tensor_adam
         self.multi_tensor_adam_param_remainder = tex.multi_tensor_adam_param_remainder
         self.multi_tensor_adam_fp8 = tex.multi_tensor_adam_fp8
+        self.multi_tensor_adam_mxfp8 = tex.multi_tensor_adam_mxfp8
         self.multi_tensor_adam_capturable = tex.multi_tensor_adam_capturable
         self.multi_tensor_adam_capturable_master = tex.multi_tensor_adam_capturable_master
 
@@ -544,18 +546,28 @@ class FusedAdam(torch.optim.Optimizer):
             # create lists for multi-tensor apply
             p_main_of_fp8_model = []
             p_main_of_f16_model = []
+            p_main_of_mxfp8_model = []
             g_of_fp8_model = []
             g_of_f16_model = []
             g_of_f32_model = []
+            g_of_mxfp8_model = []
             m_of_fp8_model = []
             m_of_f16_model = []
             m_of_f32_model = []
+            m_of_mxfp8_model = []
             v_of_fp8_model = []
             v_of_f16_model = []
             v_of_f32_model = []
+            v_of_mxfp8_model = []
             p_fp8_model = []
             p_f16_model = []
             p_f32_model = []
+            p_mxfp8_model = []
+            # mxfp8 meta
+            mxfp8_rowwise = []
+            mxfp8_colwise = []
+            mxfp8_rowwise_scale_inv = []
+            mxfp8_colwise_scale_inv = []
             # fp8 meta
             scales = []
             amaxes = []
@@ -626,6 +638,21 @@ class FusedAdam(torch.optim.Optimizer):
                     g_of_fp8_model.append(p_grad.data)
                     m_of_fp8_model.append(unscaled_state["exp_avg"])
                     v_of_fp8_model.append(unscaled_state["exp_avg_sq"])
+                elif isinstance(p, MXFP8Tensor):
+                    if self.capturable:
+                        raise RuntimeError(
+                            "FusedAdam does not support MXFP8 model weights with capturable=True."
+                        )
+                    p_mxfp8_model.append(p)
+                    p_main_of_mxfp8_model.append(unscaled_state["master_param"].data)
+                    g_of_mxfp8_model.append(p_grad.data)
+                    m_of_mxfp8_model.append(unscaled_state["exp_avg"])
+                    v_of_mxfp8_model.append(unscaled_state["exp_avg_sq"])
+                    mxfp8_rowwise.append(p._rowwise_data)
+                    mxfp8_colwise.append(p._columnwise_data)
+                    mxfp8_rowwise_scale_inv.append(p._rowwise_scale_inv)
+                    mxfp8_colwise_scale_inv.append(p._columnwise_scale_inv)
+                    out_dtype = p._fp8_dtype
                 elif p.dtype in [torch.float16, torch.bfloat16]:
                     has_fp16 = has_fp16 or p.dtype == torch.float16
                     has_bf16 = has_bf16 or p.dtype == torch.bfloat16
@@ -770,6 +797,18 @@ class FusedAdam(torch.optim.Optimizer):
                         scale_invs,
                     ]
                     apply_multi_tensor_adam(self.multi_tensor_adam_fp8, tensor_lists, out_dtype)
+                if len(p_mxfp8_model) > 0:
+                    tensor_lists = [
+                        g_of_mxfp8_model,
+                        p_main_of_mxfp8_model,
+                        m_of_mxfp8_model,
+                        v_of_mxfp8_model,
+                        mxfp8_rowwise,
+                        mxfp8_colwise,
+                        mxfp8_rowwise_scale_inv,
+                        mxfp8_colwise_scale_inv,
+                    ]
+                    apply_multi_tensor_adam(self.multi_tensor_adam_mxfp8, tensor_lists, out_dtype)
                 if len(p_f32_model) > 0:
                     tensor_lists = [
                         g_of_f32_model,
