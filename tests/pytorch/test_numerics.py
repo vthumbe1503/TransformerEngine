@@ -50,6 +50,7 @@ from transformer_engine.pytorch.cpp_extensions import (
     general_gemm,
     general_grouped_gemm,
     general_grouped_gemm_for_grouped_tensor,
+    general_grouped_gemm_for_discrete_out,
 )
 from transformer_engine.pytorch.tensor.storage.grouped_tensor import GroupedTensor
 from transformer_engine.common import recipe
@@ -2853,6 +2854,54 @@ def test_grouped_gemm_grouped_tensor(layout, accumulate):
     out_grouped = grouped_out.split_into_quantized_tensors()
     tols = dtype_tols(dtype)
     for o, o_ref in zip(out_grouped, out_ref):
+        torch.testing.assert_close(o, o_ref, **tols)
+
+
+def test_grouped_gemm_discrete_out_wgrad_accumulate() -> None:
+    if tex.get_cublasLt_version() < 130200:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.2+.")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Grouped GEMM requires Blackwell (SM100) or newer.")
+    if not is_bf16_available():
+        pytest.skip("bfloat16 is required for grouped GEMM test.")
+
+    torch.manual_seed(0)
+    z, m, k, n = (4, 512, 256, 512)
+    dtype = torch.bfloat16
+    layout = "NT"
+
+    split_points = torch.randperm(m - 1)[: z - 1] + 1
+    split_points = torch.sort(split_points).values.tolist()
+    m_sizes = [split_points[0]]
+    m_sizes += [b - a for a, b in zip(split_points[:-1], split_points[1:])]
+    m_sizes.append(m - split_points[-1])
+
+    A = [torch.randn(ms, k, dtype=dtype, device="cuda") for ms in m_sizes]  # input
+    B = [torch.randn(ms, n, dtype=dtype, device="cuda") for ms in m_sizes]  # grad_output
+    main_grad_init = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]  # wgrad
+    main_grad = [o.clone() for o in main_grad_init]
+
+    out_ref = [
+        (main_grad_init[i].float() + torch.matmul(B[i].transpose(0, 1).float(), A[i].float())).to(dtype)
+        for i in range(z)
+    ]
+
+    device = A[0].device
+    grouped_A = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+    grouped_B = _make_grouped_tensor_from_splits(m_sizes, n, device, dtype)
+    _pack_grouped_tensor(grouped_A, A)
+    _pack_grouped_tensor(grouped_B, B)
+
+    general_grouped_gemm_for_discrete_out(
+        grouped_A,
+        grouped_B,
+        main_grad,
+        layout=layout,
+        accumulate=True,
+    )
+
+    tols = dtype_tols(dtype)
+    for o, o_ref in zip(main_grad, out_ref):
         torch.testing.assert_close(o, o_ref, **tols)
 
 

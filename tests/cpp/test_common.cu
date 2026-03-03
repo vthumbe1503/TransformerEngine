@@ -1166,15 +1166,12 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                  grouped.tensor_bytes[i],
                                  cudaMemcpyDeviceToDevice));
     }
-    NVTEBasicTensor data_tensor{grouped.data.get(), static_cast<NVTEDType>(dtype), grouped.logical_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedRowwiseData, &data_tensor);
+    NVTEBasicTensor data_tensor{grouped.data.get(), static_cast<NVTEDType>(dtype),
+                                grouped.logical_shape};
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseData, &data_tensor, sizeof(data_tensor));
   }
 
-  NVTEBasicTensor data_tensor{grouped.data.get(), static_cast<NVTEDType>(dtype), grouped.logical_shape};
-  NVTEGroupedTensor h = grouped.handle.get();
-  nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseData, &data_tensor, sizeof(data_tensor));
-
-  const bool include_columnwise = isFp8Type(dtype) || isFp4Type(dtype);
+  const bool include_columnwise = has_columnwise;
   if (include_columnwise) {
     grouped.columnwise_data = cuda_alloc(total_bytes);
     for (size_t i = 0; i < num_tensors; ++i) {
@@ -1234,8 +1231,10 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
                                sizeof(float) * num_tensors, cudaMemcpyHostToDevice));
     NVTEShape scale_shape = nvte_make_shape(&num_tensors, 1);
     NVTEBasicTensor scale_tensor{grouped.scale_inv.get(), kNVTEFloat32, scale_shape};
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedRowwiseScaleInv, &scale_tensor);
-    nvte_set_grouped_tensor_param(&h, kNVTEGroupedColumnwiseScaleInv, &scale_tensor);
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseScaleInv, &scale_tensor,
+                                  sizeof(scale_tensor));
+    nvte_set_grouped_tensor_param(h, kNVTEGroupedColumnwiseScaleInv, &scale_tensor,
+                                  sizeof(scale_tensor));
   } else if (scaling_mode == NVTE_MXFP8_1D_SCALING) {
     // MXFP8: E8M0 scale_inv per block of 32 elements
     // Helper to gather scale_inv from individual tensors into a contiguous buffer
@@ -1279,7 +1278,8 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
 
       NVTEShape row_shape = nvte_make_shape(&row_total, 1);
       NVTEBasicTensor row_tensor{grouped.scale_inv.get(), kNVTEFloat8E8M0, row_shape};
-      nvte_set_grouped_tensor_param(&h, kNVTEGroupedRowwiseScaleInv, &row_tensor);
+      nvte_set_grouped_tensor_param(h, kNVTEGroupedRowwiseScaleInv, &row_tensor,
+                                    sizeof(row_tensor));
     }
 
     // Gather columnwise scale_inv if available
@@ -1291,7 +1291,8 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
 
       NVTEShape col_shape = nvte_make_shape(&col_total, 1);
       NVTEBasicTensor col_tensor{grouped.columnwise_scale_inv.get(), kNVTEFloat8E8M0, col_shape};
-      nvte_set_grouped_tensor_param(&h, kNVTEGroupedColumnwiseScaleInv, &col_tensor);
+      nvte_set_grouped_tensor_param(h, kNVTEGroupedColumnwiseScaleInv, &col_tensor,
+                                    sizeof(col_tensor));
     }
 
     // Mark as having swizzled scales (required for GEMM)

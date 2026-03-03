@@ -25,6 +25,7 @@ __all__ = [
     "general_gemm",
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
+    "general_grouped_gemm_for_discrete_out",
 ]
 
 
@@ -371,6 +372,76 @@ def general_grouped_gemm_for_grouped_tensor(
         transb,
         None,
         out,
+        alpha,
+        beta,
+        workspace_setup,
+        workspace_cublas,
+        sm_count,
+    )
+
+
+def general_grouped_gemm_for_discrete_out(
+    A,
+    B,
+    D: list,
+    *,
+    C: Optional[list] = None,
+    layout: str = "TN",
+    accumulate: bool = False,
+    alpha: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+) -> list:
+    """
+    Grouped GEMM using GroupedTensor inputs with discrete output tensors.
+    """
+    assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
+    transa = layout[0] == "T"
+    transb = layout[1] == "T"
+
+    num_tensors = A.num_tensors
+    assert A.num_tensors == B.num_tensors, (
+        f"GroupedTensor num_tensors must match: A={A.num_tensors}, B={B.num_tensors}"
+    )
+    assert len(D) == num_tensors, (
+        f"D_list must have num_tensors entries: {len(D)} vs {num_tensors}"
+    )
+    device = D[0].device
+    if C is not None:
+        assert len(C) == num_tensors, (
+            f"C must have num_tensors entries: {len(C)} vs {num_tensors}"
+        )
+    if alpha is None:
+        alpha = torch.ones(num_tensors, dtype=torch.float32, device=device)
+    if beta is None:
+        if accumulate:
+            beta = torch.ones(num_tensors, dtype=torch.float32, device=device)
+        else:
+            beta = torch.zeros(num_tensors, dtype=torch.float32, device=device)
+
+    if not alpha.is_cuda or not beta.is_cuda:
+        raise ValueError("alpha and beta must be CUDA tensors.")
+
+    workspace_setup = torch.empty(
+        get_grouped_gemm_setup_workspace_size(num_tensors),
+        dtype=torch.uint8,
+        device=device,
+    )
+    workspace_cublas = torch.empty(
+        get_cublas_workspace_size_bytes(),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    sm_count = get_sm_count()
+    sm_count = sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))
+
+    return tex.te_general_grouped_gemm_for_discrete_out(
+        A,
+        transa,
+        B,
+        transb,
+        C,
+        D,
         alpha,
         beta,
         workspace_setup,
