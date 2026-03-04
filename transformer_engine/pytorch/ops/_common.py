@@ -154,28 +154,16 @@ def make_grouped_tensor_from_mxfp8_weights(
     # GEMM expects scales in swizzled layout (same as FC1 weight scales in grouped_gemm_swiglu).
     if weights[0]._rowwise_data is not None:
         data = noop_cat([w._rowwise_data.reshape(-1) for w in weights])
-        # Same swizzle as FC1 weight scales: (num_groups, n/128, 4, 32, k/128, 4) -> permute (0, 1, 4, 3, 2, 5)
         rowwise_scales = noop_cat([w._rowwise_scale_inv for w in weights])
-        if with_gemm_swizzled_scales:
-            rowwise_scales = rowwise_scales.view(
-                num_groups, O // 128, 4, 32, I // 128, 4
-            )
-            rowwise_scales = rowwise_scales.permute(0, 1, 4, 3, 2, 5).contiguous()
         scale_inv = rowwise_scales.reshape(-1)
     # Pack columnwise into columnwise_* when available.
     # GEMM expects columnwise scales in swizzled layout (same as FC2 weight scales in backward dSwiGLU kernel).
     if weights[0]._columnwise_data is not None:
         columnwise_data = noop_cat([w._columnwise_data.reshape(-1) for w in weights])
-        # Same swizzle as FC2 weight scales in backward: (num_groups, O/128, 4, I/128, 4, 32) -> permute (0, 3, 1, 5, 4, 2)
         columnwise_scales = noop_cat([w._columnwise_scale_inv for w in weights])
-        if with_gemm_swizzled_scales:
-            columnwise_scales = columnwise_scales.view(
-                num_groups, O // 128, 4, I // 128, 4, 32
-            )
-            columnwise_scales = columnwise_scales.permute(0, 3, 1, 5, 4, 2).contiguous()
         columnwise_scale_inv = columnwise_scales.reshape(-1)
 
-    return GroupedTensor(
+    grouped_tensor = GroupedTensor(
         num_tensors=num_groups,
         shape=shape,
         quantizer=quantizer,
@@ -194,6 +182,7 @@ def make_grouped_tensor_from_mxfp8_weights(
         scale_inv_offsets=scale_inv_offsets,
         columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
         logical_shape=(logical_first_dim, logical_last_dim),
-        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+        with_gemm_swizzled_scales=False,
     )
+    return grouped_tensor
 
