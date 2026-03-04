@@ -64,11 +64,13 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
         offsets: Optional[List[int]] = None,
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
+        with_gemm_swizzled_scales: bool = False,
     ):
         del quantizer
         del offsets
         del scale_inv_offsets
         del columnwise_scale_inv_offsets
+        del with_gemm_swizzled_scales
 
         if (
             shapes is not None
@@ -203,3 +205,4 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             kwargs = {}
         # Do not force GroupedTensor on outputs.
         return torch._C._disabled_torch_function_impl(func, types, args, kwargs)
+

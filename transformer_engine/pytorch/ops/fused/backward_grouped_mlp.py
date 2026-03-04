@@ -24,7 +24,7 @@ from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
 from ...quantization import Recipe
 from ...tensor import Quantizer
-from ...tensor.storage.grouped_tensor import GroupedTensor
+from ...tensor.grouped_tensor import GroupedTensor
 from ...utils import clear_tensor_data, get_device_compute_capability
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_backward_fusion

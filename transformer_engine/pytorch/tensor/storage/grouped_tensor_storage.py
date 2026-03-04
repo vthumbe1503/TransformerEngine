@@ -388,7 +388,7 @@ class GroupedTensorStorage:
             # Kernels need to calculate precise pointers based on size of elements.
 
             # TODO(ksivaman): Single kernel + remove the host offset calculation.
-            tensor_offsets = GroupedTensor.make_tensor_offsets(first_dims, logical_last_dim)
+            tensor_offsets = GroupedTensorStorage.make_tensor_offsets(first_dims, logical_last_dim)
             if (
                 first_dims.device.type == "cuda"
                 and torch.cuda.is_available()

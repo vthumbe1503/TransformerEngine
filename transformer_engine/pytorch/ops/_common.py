@@ -17,7 +17,7 @@ from ..quantized_tensor import QuantizedTensorStorage
 from ..utils import canonicalize_dtype
 from ..module._common import noop_cat
 from ..tensor import Quantizer
-from ..tensor.storage.grouped_tensor import GroupedTensor
+from ..tensor.grouped_tensor import GroupedTensor
 
 
 def is_quantized_tensor(tensor: torch.Tensor | QuantizedTensorStorage) -> bool:

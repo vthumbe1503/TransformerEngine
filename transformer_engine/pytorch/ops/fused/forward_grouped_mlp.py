@@ -19,7 +19,7 @@ from ...module._common import noop_cat
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...utils import get_device_compute_capability
-from ...tensor.storage.grouped_tensor import GroupedTensor
+from ...tensor.grouped_tensor import GroupedTensor
 from ...constants import MXFP8_BLOCK_SCALING_SIZE
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_forward_fusion
