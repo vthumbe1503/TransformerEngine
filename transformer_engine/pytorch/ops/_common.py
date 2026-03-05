@@ -76,19 +76,18 @@ def get_fp8_meta_from_fp8_tensor(tensor: Float8Tensor) -> tuple[FP8TensorMeta, i
     return fp8_meta, 0
 
 
-
 def make_grouped_tensor_from_buffers(
     *,
     num_groups: int,
     data: torch.Tensor,
     split_sizes: torch.Tensor,
-    columnwise_data: torch.Tensor=None,
-    scale_inv: torch.Tensor=None,
-    columnwise_scale_inv: torch.Tensor=None,
-    tensor_offsets: torch.Tensor=None,
+    columnwise_data: torch.Tensor = None,
+    scale_inv: torch.Tensor = None,
+    columnwise_scale_inv: torch.Tensor = None,
+    tensor_offsets: torch.Tensor = None,
     logical_last_dim: int,
     dtype: torch.dtype,
-    quantizer: Quantizer=None,
+    quantizer: Quantizer = None,
     with_gemm_swizzled_scales: bool = False,
 ) -> GroupedTensor:
     """Build GroupedTensor from FC1+SwiGLU / dSwiGLU kernel outputs.
@@ -130,8 +129,7 @@ def make_grouped_tensor_from_mxfp8_weights(
     dtype: torch.dtype,
     with_gemm_swizzled_scales: bool = False,
 ) -> GroupedTensor:
-    """Build a GroupedTensor from MXFP8 weight tensors by packing their buffers (no copy when contiguous).
-    """
+    """Build a GroupedTensor from MXFP8 weight tensors by packing their buffers (no copy when contiguous)."""
     num_groups = len(weights)
     weight_shape = weights[0].shape
     O, I = weight_shape[0], weight_shape[1]
@@ -139,9 +137,7 @@ def make_grouped_tensor_from_mxfp8_weights(
     logical_last_dim = I
     shape = [weight_shape] * num_groups
 
-    tensor_offsets = torch.arange(
-        num_groups + 1, dtype=torch.int64, device=device
-    ) * (O * I)
+    tensor_offsets = torch.arange(num_groups + 1, dtype=torch.int64, device=device) * (O * I)
     data = None
     scale_inv = None
     scale_inv_offsets = None
@@ -156,9 +152,7 @@ def make_grouped_tensor_from_mxfp8_weights(
         # Same swizzle as FC1 weight scales: (num_groups, n/128, 4, 32, k/128, 4) -> permute (0, 1, 4, 3, 2, 5)
         rowwise_scales = noop_cat([w._rowwise_scale_inv for w in weights])
         if with_gemm_swizzled_scales:
-            rowwise_scales = rowwise_scales.view(
-                num_groups, O // 128, 4, 32, I // 128, 4
-            )
+            rowwise_scales = rowwise_scales.view(num_groups, O // 128, 4, 32, I // 128, 4)
             rowwise_scales = rowwise_scales.permute(0, 1, 4, 3, 2, 5).contiguous()
         scale_inv = rowwise_scales.reshape(-1)
     # Pack columnwise into columnwise_* when available.
@@ -168,9 +162,7 @@ def make_grouped_tensor_from_mxfp8_weights(
         # Same swizzle as FC2 weight scales in backward: (num_groups, O/128, 4, I/128, 4, 32) -> permute (0, 3, 1, 5, 4, 2)
         columnwise_scales = noop_cat([w._columnwise_scale_inv for w in weights])
         if with_gemm_swizzled_scales:
-            columnwise_scales = columnwise_scales.view(
-                num_groups, O // 128, 4, I // 128, 4, 32
-            )
+            columnwise_scales = columnwise_scales.view(num_groups, O // 128, 4, I // 128, 4, 32)
             columnwise_scales = columnwise_scales.permute(0, 3, 1, 5, 4, 2).contiguous()
         columnwise_scale_inv = columnwise_scales.reshape(-1)
 
@@ -194,4 +186,3 @@ def make_grouped_tensor_from_mxfp8_weights(
         columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
-

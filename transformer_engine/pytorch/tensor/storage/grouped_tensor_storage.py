@@ -146,6 +146,8 @@ class GroupedTensorStorage:
         # Used as a convenience.
         instance.quantized_tensors = None
 
+        instance.with_gemm_swizzled_scales = with_gemm_swizzled_scales
+
     def __new__(
         cls,
         shape: Tuple[int, int],
@@ -167,6 +169,7 @@ class GroupedTensorStorage:
         offsets: Optional[List[int]] = None,
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
+        with_gemm_swizzled_scales: bool = False,
         requires_grad: bool = False,
         stride: Optional[List[int]] = None,
     ):
@@ -191,6 +194,7 @@ class GroupedTensorStorage:
             offsets=offsets,
             scale_inv_offsets=scale_inv_offsets,
             columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            with_gemm_swizzled_scales=with_gemm_swizzled_scales,
             requires_grad=requires_grad,
             stride=stride,
         )

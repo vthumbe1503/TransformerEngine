@@ -150,16 +150,17 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
 py::object te_general_grouped_gemm_for_grouped_tensor(py::handle A, bool transa, py::handle B,
-    bool transb, py::object C, py::handle D,
-    at::Tensor alpha, at::Tensor beta,
-    at::Tensor workspace_setup,
-    at::Tensor workspace_cublas,
-    int math_sm_count);
+                                                      bool transb, py::object C, py::handle D,
+                                                      at::Tensor alpha, at::Tensor beta,
+                                                      at::Tensor workspace_setup,
+                                                      at::Tensor workspace_cublas,
+                                                      int math_sm_count);
 
-py::object te_general_grouped_gemm_for_discrete_out(
-    py::handle A, bool transa, py::handle B, bool transb, py::object C_list, py::handle D_list,
-    at::Tensor alpha, at::Tensor beta, at::Tensor workspace_setup, at::Tensor workspace_cublas,
-    int math_sm_count);
+py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, py::handle B,
+                                                    bool transb, py::object C_list,
+                                                    py::handle D_list, at::Tensor alpha,
+                                                    at::Tensor beta, at::Tensor workspace_setup,
+                                                    at::Tensor workspace_cublas, int math_sm_count);
 
 /***************************************************************************************************
  * Transpose

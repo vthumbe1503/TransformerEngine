@@ -155,6 +155,7 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             offsets=offsets,
             scale_inv_offsets=scale_inv_offsets,
             columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            with_gemm_swizzled_scales=with_gemm_swizzled_scales,
         )
         return instance
 

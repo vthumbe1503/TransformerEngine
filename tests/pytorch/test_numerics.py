@@ -2905,7 +2905,9 @@ def test_grouped_gemm_discrete_out_wgrad_accumulate() -> None:
     main_grad = [o.clone() for o in main_grad_init]
 
     out_ref = [
-        (main_grad_init[i].float() + torch.matmul(B[i].transpose(0, 1).float(), A[i].float())).to(dtype)
+        (main_grad_init[i].float() + torch.matmul(B[i].transpose(0, 1).float(), A[i].float())).to(
+            dtype
+        )
         for i in range(z)
     ]
 

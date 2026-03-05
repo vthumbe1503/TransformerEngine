@@ -37,7 +37,6 @@ from .._common import (
 )
 
 
-
 class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
     """Fused op for MXFP8 GroupedLinear + ScaledSwiGLU + GroupedLinear
 
@@ -145,7 +144,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc1_x_scale,
             fc1_x_col_scale,
             fc1_x_tensor_offsets,
-        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
+        ), saved_tensors = (
+            saved_tensors[:5],
+            saved_tensors[5:],
+        )
 
         # Saved tensors from scaled SwiGLU forward
         swiglu_in, scales = swiglu_ctx.saved_tensors
@@ -160,7 +162,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc2_x_scale,
             fc2_x_col_scale,
             fc2_x_tensor_offsets,
-        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
+        ), saved_tensors = (
+            saved_tensors[:5],
+            saved_tensors[5:],
+        )
 
         # Group splits
         if int(split_sizes.numel()) != num_groups:
@@ -300,7 +305,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc1_dy_row_data = fc1_dy_row_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_row_scale = fc2_dgrad_kernel_out["sfd_row_tensor"]
         fc1_dy_row_scale = fc1_dy_row_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_row_scale = fc1_dy_row_scale.view(out_shape[0], fc1_weight_shape[0] // 32).contiguous()
+        fc1_dy_row_scale = fc1_dy_row_scale.view(
+            out_shape[0], fc1_weight_shape[0] // 32
+        ).contiguous()
         fc1_dy_col_data = fc2_dgrad_kernel_out["d_col_tensor"]
         fc1_dy_col_data = fc1_dy_col_data.permute(2, 0, 1)
         fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()

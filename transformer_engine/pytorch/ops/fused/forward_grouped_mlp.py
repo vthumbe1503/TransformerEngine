@@ -32,7 +32,6 @@ from .._common import (
 )
 
 
-
 class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
     """Fused op for MXFP8 GroupedLinear + ScaledSwiGLU + GroupedLinear
 
@@ -164,12 +163,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
-        fc1_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
-            split_sizes, fc1_weight_shape[1]
-        )
-        fc2_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
-            split_sizes, fc2_weight_shape[1]
-        )
+        fc1_x_tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, fc1_weight_shape[1])
+        fc2_x_tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, fc2_weight_shape[1])
 
         # Extract post-scales from extra input
         scales = basic_op_extra_inputs[1][0]
@@ -305,7 +300,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             tensor_offsets=fc2_x_tensor_offsets,
         )
 
-        # FC2 GEMM 
+        # FC2 GEMM
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
         fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
         grouped_fc2_out = make_grouped_tensor_from_buffers(
@@ -318,11 +313,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
 
         # weights needs to be swizzled/optimized for GEMM
         grouped_fc2_w = make_grouped_tensor_from_mxfp8_weights(
-            fc2_ws,
-            fc2_weight_quantizers[0],
-            device,
-            dtype,
-            with_gemm_swizzled_scales=True
+            fc2_ws, fc2_weight_quantizers[0], device, dtype, with_gemm_swizzled_scales=True
         )
         general_grouped_gemm_for_grouped_tensor(
             grouped_fc2_w,
@@ -345,11 +336,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 grouped_fc1_x.columnwise_scale_inv.grouped_name = "fc1_columnwise_scale_inv"
                 grouped_fc1_x.columnwise_scale_inv.logical_shape = grouped_fc1_x.logical_shape
                 fc1_input_tensors = (
-                    None, # data
-                    grouped_fc1_x.columnwise_data, # columnwise_data
-                    None, # scale_inv
-                    grouped_fc1_x.columnwise_scale_inv, # columnwise_scale_inv
-                    fc1_x_tensor_offsets, # tensor_offsets
+                    None,  # data
+                    grouped_fc1_x.columnwise_data,  # columnwise_data
+                    None,  # scale_inv
+                    grouped_fc1_x.columnwise_scale_inv,  # columnwise_scale_inv
+                    fc1_x_tensor_offsets,  # tensor_offsets
                 )
             else:
                 fc1_input_tensors = (None, None, None, None, None)
@@ -379,11 +370,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 grouped_fc2_x.columnwise_scale_inv.grouped_name = "fc2_columnwise_scale_inv"
                 grouped_fc2_x.columnwise_scale_inv.logical_shape = grouped_fc2_x.logical_shape
                 fc2_input_tensors = (
-                    None, # data
-                    grouped_fc2_x.columnwise_data, # columnwise_data
-                    None, # scale_inv
-                    grouped_fc2_x.columnwise_scale_inv, # columnwise_scale_inv
-                    fc2_x_tensor_offsets, # tensor_offsets
+                    None,  # data
+                    grouped_fc2_x.columnwise_data,  # columnwise_data
+                    None,  # scale_inv
+                    grouped_fc2_x.columnwise_scale_inv,  # columnwise_scale_inv
+                    fc2_x_tensor_offsets,  # tensor_offsets
                 )
             else:
                 fc2_input_tensors = (None, None, None, None, None)
