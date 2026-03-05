@@ -24,7 +24,7 @@ from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
 from ...quantization import Recipe
 from ...tensor import Quantizer
-from ...tensor.storage.grouped_tensor import GroupedTensor
+from ...tensor.grouped_tensor import GroupedTensor
 from ...utils import clear_tensor_data, get_device_compute_capability
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_backward_fusion
@@ -35,7 +35,6 @@ from .._common import (
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
-
 
 
 class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
@@ -145,7 +144,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc1_x_scale,
             fc1_x_col_scale,
             fc1_x_tensor_offsets,
-        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
+        ), saved_tensors = (
+            saved_tensors[:5],
+            saved_tensors[5:],
+        )
 
         # Saved tensors from scaled SwiGLU forward
         swiglu_in, scales = swiglu_ctx.saved_tensors
@@ -160,7 +162,10 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             fc2_x_scale,
             fc2_x_col_scale,
             fc2_x_tensor_offsets,
-        ), saved_tensors = saved_tensors[:5], saved_tensors[5:]
+        ), saved_tensors = (
+            saved_tensors[:5],
+            saved_tensors[5:],
+        )
 
         # Group splits
         if int(split_sizes.numel()) != num_groups:
@@ -223,7 +228,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (sum(m), k, 1)
         # Scale logical shape: (32 (block row), 4 (block row),
         #   sum(m)/128, 4 (block col), k/128, 1)
-        fc2_dy_data = grouped_fc2_dy.data.view(out_shape[0], out_shape[1])
+        fc2_dy_data = grouped_fc2_dy.rowwise_data.view(out_shape[0], out_shape[1])
         fc2_dy_data = fc2_dy_data.view(dtype=torch.float8_e4m3fn)
         fc2_dy_data = fc2_dy_data.unsqueeze(0).permute(1, 2, 0)
         fc2_dy_scales = grouped_fc2_dy.scale_inv
@@ -300,7 +305,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         fc1_dy_row_data = fc1_dy_row_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
         fc1_dy_row_scale = fc2_dgrad_kernel_out["sfd_row_tensor"]
         fc1_dy_row_scale = fc1_dy_row_scale.permute(5, 2, 4, 0, 1, 3)
-        fc1_dy_row_scale = fc1_dy_row_scale.view(out_shape[0], fc1_weight_shape[0] // 32).contiguous()
+        fc1_dy_row_scale = fc1_dy_row_scale.view(
+            out_shape[0], fc1_weight_shape[0] // 32
+        ).contiguous()
         fc1_dy_col_data = fc2_dgrad_kernel_out["d_col_tensor"]
         fc1_dy_col_data = fc1_dy_col_data.permute(2, 0, 1)
         fc1_dy_col_data = fc1_dy_col_data.view(out_shape[0], fc1_weight_shape[0]).contiguous()
@@ -357,7 +364,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             else:
                 grouped_fc2_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
                     num_tensors=num_groups,
-                    shape=[fc2_weight_shape] * num_groups,
+                    shapes=[fc2_weight_shape] * num_groups,
                     quantizer=None,
                     device=device,
                     dtype=dtype,
@@ -466,7 +473,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             else:
                 grouped_fc1_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
                     num_tensors=num_groups,
-                    shape=[fc1_weight_shape] * num_groups,
+                    shapes=[fc1_weight_shape] * num_groups,
                     quantizer=None,
                     device=device,
                     dtype=dtype,

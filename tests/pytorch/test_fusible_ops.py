@@ -3254,7 +3254,7 @@ class TestSequentialModules:
         """GroupedLinear + ScaledSwiGLU + GroupedLinear"""
 
         # Split sizes
-        split_sizes = [split_alignment * i for i in range(group_size)]
+        split_sizes = [split_alignment * (i) for i in range(group_size)]
         random.shuffle(split_sizes)
         split_sizes = torch.tensor(split_sizes, dtype=torch.int, device=device)
 
@@ -3559,9 +3559,11 @@ class TestSequentialModules:
         if static_probs.grad is not None:
             static_probs.grad.zero_()
 
-        graph_out = train_step(
-            static_x, static_probs, static_dy, static_out_buf, use_graphed=True
-        ).detach().clone()
+        graph_out = (
+            train_step(static_x, static_probs, static_dy, static_out_buf, use_graphed=True)
+            .detach()
+            .clone()
+        )
         torch.cuda.synchronize()
         graph_dx = static_x.grad.detach().clone()
         graph_dprobs = static_probs.grad.detach().clone()
@@ -3590,7 +3592,6 @@ class TestSequentialModules:
         assert_close(graph_dprobs, expected_probs.grad, **tols)
         for graph_grad, param in zip(graph_param_grads, module.parameters()):
             assert_close(graph_grad, param.grad, **tols)
-
 
 
 class TestCustomOps:

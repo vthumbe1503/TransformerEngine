@@ -216,8 +216,8 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
   auto ret = GroupedTensorWrapper(num_tensors, logical_shape, scaling_mode);
 
   // Rowwise data
-  if (!tensor.attr("data").is_none()) {
-    const auto &data = tensor.attr("data").cast<at::Tensor>();
+  if (py::hasattr(tensor, "rowwise_data") && !tensor.attr("rowwise_data").is_none()) {
+    const auto &data = tensor.attr("rowwise_data").cast<at::Tensor>();
     DType data_dtype =
         quantizer.is_none() ? GetTransformerEngineDType(data.scalar_type()) : quantizer_dtype;
     ret.set_rowwise_data(data.data_ptr(), data_dtype, getTensorShape(data));
@@ -282,9 +282,8 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
                            getTensorShape(tensor_offsets));
   }
 
-
   bool with_gemm_swizzled = false;
-  if(!tensor.attr("with_gemm_swizzled_scales").is_none()) {
+  if (!tensor.attr("with_gemm_swizzled_scales").is_none()) {
     with_gemm_swizzled = tensor.attr("with_gemm_swizzled_scales").cast<bool>();
   }
   ret.set_with_gemm_swizzled_scales(with_gemm_swizzled);

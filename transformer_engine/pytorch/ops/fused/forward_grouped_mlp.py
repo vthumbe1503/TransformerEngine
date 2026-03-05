@@ -19,7 +19,7 @@ from ...module._common import noop_cat
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...utils import get_device_compute_capability
-from ...tensor.storage.grouped_tensor import GroupedTensor
+from ...tensor.grouped_tensor import GroupedTensor
 from ...constants import MXFP8_BLOCK_SCALING_SIZE
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_forward_fusion
@@ -30,7 +30,6 @@ from .._common import (
     make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
-
 
 
 class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
@@ -164,12 +163,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
         split_sizes = split_sizes.to(dtype=torch.int64, device=device)
         split_points = torch.cumsum(split_sizes, 0, dtype=torch.int)
-        fc1_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
-            split_sizes, fc1_weight_shape[1]
-        )
-        fc2_x_tensor_offsets = GroupedTensor.make_tensor_offsets(
-            split_sizes, fc2_weight_shape[1]
-        )
+        fc1_x_tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, fc1_weight_shape[1])
+        fc2_x_tensor_offsets = GroupedTensor.make_tensor_offsets(split_sizes, fc2_weight_shape[1])
 
         # Extract post-scales from extra input
         scales = basic_op_extra_inputs[1][0]
@@ -202,7 +197,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (sum(m), k, 1)
         # Scale logical shape: (32 (block row), 4 (block row),
         #   sum(m)/128, 4 (block col), k/128, 1)
-        fc1_x_data = grouped_fc1_x.data.view(in_shape[0], in_shape[1])
+        fc1_x_data = grouped_fc1_x.rowwise_data.view(in_shape[0], in_shape[1])
         fc1_x_data = fc1_x_data.view(dtype=torch.float8_e4m3fn)
         fc1_x_data = fc1_x_data.unsqueeze(0).permute(1, 2, 0)
         fc1_x_scales = grouped_fc1_x.scale_inv
@@ -305,7 +300,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             tensor_offsets=fc2_x_tensor_offsets,
         )
 
-        # FC2 GEMM 
+        # FC2 GEMM
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
         fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
         grouped_fc2_out = make_grouped_tensor_from_buffers(
@@ -343,11 +338,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 grouped_fc1_x.columnwise_scale_inv.grouped_name = "fc1_columnwise_scale_inv"
                 grouped_fc1_x.columnwise_scale_inv.logical_shape = grouped_fc1_x.logical_shape
                 fc1_input_tensors = (
-                    None, # data
-                    grouped_fc1_x.columnwise_data, # columnwise_data
-                    None, # scale_inv
-                    grouped_fc1_x.columnwise_scale_inv, # columnwise_scale_inv
-                    fc1_x_tensor_offsets, # tensor_offsets
+                    None,  # data
+                    grouped_fc1_x.columnwise_data,  # columnwise_data
+                    None,  # scale_inv
+                    grouped_fc1_x.columnwise_scale_inv,  # columnwise_scale_inv
+                    fc1_x_tensor_offsets,  # tensor_offsets
                 )
             else:
                 fc1_input_tensors = (None, None, None, None, None)
@@ -377,11 +372,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 grouped_fc2_x.columnwise_scale_inv.grouped_name = "fc2_columnwise_scale_inv"
                 grouped_fc2_x.columnwise_scale_inv.logical_shape = grouped_fc2_x.logical_shape
                 fc2_input_tensors = (
-                    None, # data
-                    grouped_fc2_x.columnwise_data, # columnwise_data
-                    None, # scale_inv
-                    grouped_fc2_x.columnwise_scale_inv, # columnwise_scale_inv
-                    fc2_x_tensor_offsets, # tensor_offsets
+                    None,  # data
+                    grouped_fc2_x.columnwise_data,  # columnwise_data
+                    None,  # scale_inv
+                    grouped_fc2_x.columnwise_scale_inv,  # columnwise_scale_inv
+                    fc2_x_tensor_offsets,  # tensor_offsets
                 )
             else:
                 fc2_input_tensors = (None, None, None, None, None)

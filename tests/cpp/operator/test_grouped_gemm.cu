@@ -55,7 +55,7 @@ size_t grouped_setup_workspace_size(const size_t num_tensors) {
 
 Tensor make_fp8_operand(const std::string& name, const std::vector<size_t>& shape) {
   Tensor input_fp32(name + "_fp32", shape, DType::kFloat32);
-  
+
   const size_t numel = shape[0] * shape[1];
   std::vector<float> data(numel);
   std::mt19937 gen(std::hash<std::string>{}(name));

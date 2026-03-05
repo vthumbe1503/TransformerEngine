@@ -15,7 +15,7 @@ from ..utils import get_sm_count, _empty_tensor
 
 from ..quantized_tensor import Quantizer
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
-from ..tensor.storage.grouped_tensor import GroupedTensor
+from ..tensor.grouped_tensor import GroupedTensor
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
 from ...debug.pytorch.debug_quantization import DebugQuantizer
@@ -399,17 +399,13 @@ def general_grouped_gemm_for_discrete_out(
     transb = layout[1] == "T"
 
     num_tensors = A.num_tensors
-    assert A.num_tensors == B.num_tensors, (
-        f"GroupedTensor num_tensors must match: A={A.num_tensors}, B={B.num_tensors}"
-    )
-    assert len(D) == num_tensors, (
-        f"D_list must have num_tensors entries: {len(D)} vs {num_tensors}"
-    )
+    assert (
+        A.num_tensors == B.num_tensors
+    ), f"GroupedTensor num_tensors must match: A={A.num_tensors}, B={B.num_tensors}"
+    assert len(D) == num_tensors, f"D_list must have num_tensors entries: {len(D)} vs {num_tensors}"
     device = D[0].device
     if C is not None:
-        assert len(C) == num_tensors, (
-            f"C must have num_tensors entries: {len(C)} vs {num_tensors}"
-        )
+        assert len(C) == num_tensors, f"C must have num_tensors entries: {len(C)} vs {num_tensors}"
     if alpha is None:
         alpha = torch.ones(num_tensors, dtype=torch.float32, device=device)
     if beta is None:

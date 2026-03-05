@@ -813,8 +813,7 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   }
 
   const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
-  const bool is_single_tensor =
-      (shape_rep == SAME_BOTH_DIMS) || (shape_rep == VARYING_FIRST_DIM);
+  const bool is_single_tensor = (shape_rep == SAME_BOTH_DIMS) || (shape_rep == VARYING_FIRST_DIM);
 
   NVTE_CHECK(input->num_tensors == output->num_tensors,
              "Number of input and output tensors must be same.");
