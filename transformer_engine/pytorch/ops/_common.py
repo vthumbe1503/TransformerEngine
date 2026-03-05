@@ -102,10 +102,10 @@ def make_grouped_tensor_from_buffers(
     if ndim == 1:
         logical_first_dim = logical_first_dim // logical_last_dim
     return GroupedTensor(
-        num_tensors=num_groups,
-        shape=None,
-        quantizer=quantizer,
+        shape=(logical_first_dim, logical_last_dim),
         dtype=dtype,
+        quantizer=quantizer,
+        num_tensors=num_groups,
         data=data,
         columnwise_data=columnwise_data,
         scale_inv=scale_inv,
@@ -119,7 +119,6 @@ def make_grouped_tensor_from_buffers(
         offsets=None,
         scale_inv_offsets=None,
         columnwise_scale_inv_offsets=None,
-        logical_shape=(logical_first_dim, logical_last_dim),
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
 
@@ -176,10 +175,10 @@ def make_grouped_tensor_from_mxfp8_weights(
         columnwise_scale_inv = columnwise_scales.reshape(-1)
 
     return GroupedTensor(
-        num_tensors=num_groups,
-        shape=shape,
-        quantizer=quantizer,
+        shape=(logical_first_dim, logical_last_dim),
         dtype=dtype,
+        num_tensors=num_groups,
+        quantizer=quantizer,
         data=data,
         columnwise_data=columnwise_data,
         scale_inv=scale_inv,
@@ -193,7 +192,6 @@ def make_grouped_tensor_from_mxfp8_weights(
         offsets=None,
         scale_inv_offsets=scale_inv_offsets,
         columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
-        logical_shape=(logical_first_dim, logical_last_dim),
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
 

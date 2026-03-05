@@ -223,7 +223,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (sum(m), k, 1)
         # Scale logical shape: (32 (block row), 4 (block row),
         #   sum(m)/128, 4 (block col), k/128, 1)
-        fc2_dy_data = grouped_fc2_dy.data.view(out_shape[0], out_shape[1])
+        fc2_dy_data = grouped_fc2_dy.rowwise_data.view(out_shape[0], out_shape[1])
         fc2_dy_data = fc2_dy_data.view(dtype=torch.float8_e4m3fn)
         fc2_dy_data = fc2_dy_data.unsqueeze(0).permute(1, 2, 0)
         fc2_dy_scales = grouped_fc2_dy.scale_inv
