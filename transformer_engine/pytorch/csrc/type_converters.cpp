@@ -221,12 +221,6 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
     DType data_dtype =
         quantizer.is_none() ? GetTransformerEngineDType(data.scalar_type()) : quantizer_dtype;
     ret.set_rowwise_data(data.data_ptr(), data_dtype, getTensorShape(data));
-  } else if (!tensor.attr("data").is_none()) {
-    // Backward compatibility: older Python objects expose rowwise data as "data".
-    const auto &data = tensor.attr("data").cast<at::Tensor>();
-    DType data_dtype =
-        quantizer.is_none() ? GetTransformerEngineDType(data.scalar_type()) : quantizer_dtype;
-    ret.set_rowwise_data(data.data_ptr(), data_dtype, getTensorShape(data));
   }
 
   // Columnwise data
