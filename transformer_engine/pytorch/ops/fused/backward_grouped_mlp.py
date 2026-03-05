@@ -414,9 +414,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 fc1_ws,
                 fc1_ctx.weight_quantizers[0],
                 device,
-                dtype,
-                with_gemm_swizzled_scales=True,
-            )
+                dtype)
             grouped_grad_input = make_grouped_tensor_from_buffers(
                 num_groups=num_groups,
                 data=grad_input,

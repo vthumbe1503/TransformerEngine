@@ -129,7 +129,6 @@ def make_grouped_tensor_from_mxfp8_weights(
     quantizer: Quantizer,
     device: torch.device,
     dtype: torch.dtype,
-    with_gemm_swizzled_scales: bool = False,
 ) -> GroupedTensor:
     """Build a GroupedTensor from MXFP8 weight tensors by packing their buffers (no copy when contiguous).
     """
@@ -140,9 +139,7 @@ def make_grouped_tensor_from_mxfp8_weights(
     logical_last_dim = I
     shape = [weight_shape] * num_groups
 
-    tensor_offsets = torch.arange(
-        num_groups + 1, dtype=torch.int64, device=device
-    ) * (O * I)
+    tensor_offsets = None
     data = None
     scale_inv = None
     scale_inv_offsets = None

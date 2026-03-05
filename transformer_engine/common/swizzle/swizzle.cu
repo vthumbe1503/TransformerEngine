@@ -908,6 +908,9 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
   NVTE_CHECK(input->all_same_last_dim() && input->all_same_first_dim(),
              "Grouped swizzle requires uniform tensor shapes.");
 
+  // Assumption is that all the tensors share the same shapes and are contgiuous.
+  // And so we dont need to pass array of input/output pointers(due to conttiguity)
+  // as well as array of shapes(due to uniform shapes).
   const size_t first_dim = input->get_common_first_dim();
   const size_t last_dim = input->get_common_last_dim();
 

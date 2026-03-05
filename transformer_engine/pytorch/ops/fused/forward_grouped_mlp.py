@@ -321,9 +321,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc2_ws,
             fc2_weight_quantizers[0],
             device,
-            dtype,
-            with_gemm_swizzled_scales=True
-        )
+            dtype)
         general_grouped_gemm_for_grouped_tensor(
             grouped_fc2_w,
             grouped_fc2_x,
