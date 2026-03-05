@@ -52,7 +52,7 @@ from transformer_engine.pytorch.cpp_extensions import (
     general_grouped_gemm_for_grouped_tensor,
     general_grouped_gemm_for_discrete_out,
 )
-from transformer_engine.pytorch.tensor.storage.grouped_tensor import GroupedTensor
+from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 from transformer_engine.common import recipe
 import transformer_engine_torch as tex
 from utils import ModelConfig, reset_rng_states
@@ -2711,10 +2711,15 @@ def test_transformer_layer_hidden_states_format(dtype, bs, model):
 
 
 def _pack_grouped_tensor(grouped_tensor: GroupedTensor, tensors: List[torch.Tensor]) -> None:
+    data = grouped_tensor.rowwise_data
+    if data is None:
+        data = grouped_tensor.columnwise_data
+    if data is None:
+        raise ValueError("GroupedTensor has no data buffers to pack.")
     offset = 0
     for tensor in tensors:
         numel = tensor.numel()
-        grouped_tensor.data[offset : offset + numel].copy_(tensor.reshape(-1))
+        data[offset : offset + numel].copy_(tensor.reshape(-1))
         offset += numel
 
 
@@ -2770,6 +2775,24 @@ def _make_mxfp8_quantizer(*, is_a: bool, transposed: bool) -> MXFP8Quantizer:
     )
     quantizer.optimize_for_gemm = True
     return quantizer
+
+
+def _make_grouped_tensor_quantized(
+    tensors: List[torch.Tensor],
+    quantizer: MXFP8Quantizer,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> GroupedTensor:
+    shapes = [tuple(t.size()) for t in tensors]
+    grouped = GroupedTensor.make_grouped_tensor_with_shapes(
+        num_tensors=len(tensors),
+        shapes=shapes,
+        quantizer=quantizer,
+        device=device,
+        dtype=dtype,
+    )
+    grouped.quantize(tensors)
+    return grouped
 
 
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
@@ -2936,18 +2959,8 @@ def test_grouped_gemm_grouped_tensor_mxfp8(layout: str) -> None:
     a_quantizer = _make_mxfp8_quantizer(is_a=True, transposed=transa)
     b_quantizer = _make_mxfp8_quantizer(is_a=False, transposed=transb)
 
-    grouped_A = GroupedTensor.create_and_quantize(
-        tensors=A,
-        quantizer=a_quantizer,
-        device="cuda",
-        dtype=dtype,
-    )
-    grouped_B = GroupedTensor.create_and_quantize(
-        tensors=B,
-        quantizer=b_quantizer,
-        device="cuda",
-        dtype=dtype,
-    )
+    grouped_A = _make_grouped_tensor_quantized(A, a_quantizer, "cuda", dtype)
+    grouped_B = _make_grouped_tensor_quantized(B, b_quantizer, "cuda", dtype)
     A_fp8 = grouped_A.split_into_quantized_tensors()
     B_fp8 = grouped_B.split_into_quantized_tensors()
 

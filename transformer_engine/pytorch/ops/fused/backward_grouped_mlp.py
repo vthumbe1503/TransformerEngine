@@ -357,7 +357,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             else:
                 grouped_fc2_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
                     num_tensors=num_groups,
-                    shape=[fc2_weight_shape] * num_groups,
+                    shapes=[fc2_weight_shape] * num_groups,
                     quantizer=None,
                     device=device,
                     dtype=dtype,
@@ -468,7 +468,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             else:
                 grouped_fc1_wgrad = GroupedTensor.make_grouped_tensor_with_shapes(
                     num_tensors=num_groups,
-                    shape=[fc1_weight_shape] * num_groups,
+                    shapes=[fc1_weight_shape] * num_groups,
                     quantizer=None,
                     device=device,
                     dtype=dtype,

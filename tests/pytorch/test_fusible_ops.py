@@ -3254,7 +3254,7 @@ class TestSequentialModules:
         """GroupedLinear + ScaledSwiGLU + GroupedLinear"""
 
         # Split sizes
-        split_sizes = [split_alignment * i for i in range(group_size)]
+        split_sizes = [split_alignment * (i + 1) for i in range(group_size)]
         random.shuffle(split_sizes)
         split_sizes = torch.tensor(split_sizes, dtype=torch.int, device=device)
 
