@@ -27,7 +27,6 @@ from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
     is_quantized_tensor,
     make_grouped_tensor_from_buffers,
-    make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
 
@@ -311,14 +310,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             logical_last_dim=fc2_weight_shape[0],
         )
 
-        # weights needs to be swizzled/optimized for GEMM
-        grouped_fc2_w = make_grouped_tensor_from_mxfp8_weights(
-            fc2_ws,
-            fc2_weight_quantizers[0],
-            device,
-            dtype)
         general_grouped_gemm_for_grouped_tensor(
-            grouped_fc2_w,
+            fc2_ws,
             grouped_fc2_x,
             grouped_fc2_out,
             layout="TN",

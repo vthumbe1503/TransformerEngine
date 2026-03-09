@@ -9,9 +9,7 @@
 #include <optional>
 #include <string>
 
-#include "../common.h"
 #include "../extensions.h"
-#include "common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -76,6 +74,43 @@ bool checkGemmShape(const std::vector<size_t>& expected, const NVTEShape& actual
     if (expected[i] != actual.data[i]) return false;
   }
   return true;
+}
+
+struct GroupedGemmConfig {
+  TensorWrapper te_alpha;
+  TensorWrapper te_beta;
+  TensorWrapper te_workspace_setup;
+  TensorWrapper te_workspace_cublas;
+  std::optional<transformer_engine::GroupedMatmulConfigWrapper> matmul_config;
+};
+
+GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
+                                              at::Tensor workspace_setup,
+                                              at::Tensor workspace_cublas, size_t num_tensors,
+                                              int math_sm_count) {
+  NVTE_CHECK(alpha.numel() == static_cast<int64_t>(num_tensors),
+             "Grouped GEMM expects alpha to have num_tensors elements.");
+  NVTE_CHECK(beta.numel() == static_cast<int64_t>(num_tensors),
+             "Grouped GEMM expects beta to have num_tensors elements.");
+
+  GroupedGemmConfig grouped_gemm_config{
+      makeTransformerEngineTensor(alpha),
+      makeTransformerEngineTensor(beta),
+      makeTransformerEngineTensor(
+          workspace_setup.data_ptr(),
+          std::vector<size_t>{static_cast<size_t>(workspace_setup.numel())}, DType::kByte),
+      makeTransformerEngineTensor(
+          workspace_cublas.data_ptr(),
+          std::vector<size_t>{static_cast<size_t>(workspace_cublas.numel())}, DType::kByte),
+      std::nullopt,
+  };
+
+  if (math_sm_count > 0) {
+    grouped_gemm_config.matmul_config.emplace();
+    grouped_gemm_config.matmul_config->set_sm_count(math_sm_count);
+  }
+
+  return grouped_gemm_config;
 }
 
 }  // namespace detail
@@ -694,26 +729,8 @@ py::object te_general_grouped_gemm_for_grouped_tensor(py::handle A, bool transa,
                "Grouped GEMM requires C to have the same num_tensors as inputs.");
   }
 
-  NVTE_CHECK(alpha.numel() == static_cast<int64_t>(num_tensors),
-             "Grouped GEMM expects alpha to have num_tensors elements.");
-  NVTE_CHECK(beta.numel() == static_cast<int64_t>(num_tensors),
-             "Grouped GEMM expects beta to have num_tensors elements.");
-
-  auto te_alpha = makeTransformerEngineTensor(alpha);
-  auto te_beta = makeTransformerEngineTensor(beta);
-
-  auto te_workspace_setup = makeTransformerEngineTensor(
-      workspace_setup.data_ptr(), std::vector<size_t>{static_cast<size_t>(workspace_setup.numel())},
-      DType::kByte);
-  auto te_workspace_cublas = makeTransformerEngineTensor(
-      workspace_cublas.data_ptr(),
-      std::vector<size_t>{static_cast<size_t>(workspace_cublas.numel())}, DType::kByte);
-
-  std::optional<transformer_engine::GroupedMatmulConfigWrapper> config;
-  if (math_sm_count > 0) {
-    config.emplace();
-    config->set_sm_count(math_sm_count);
-  }
+  auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
+                                            num_tensors, math_sm_count);
 
   auto grouped_A_swizzled = maybe_swizzle_grouped_tensor_for_gemm(grouped_A);
   auto grouped_B_swizzled = maybe_swizzle_grouped_tensor_for_gemm(grouped_B);
@@ -725,10 +742,84 @@ py::object te_general_grouped_gemm_for_grouped_tensor(py::handle A, bool transa,
   NVTE_SCOPED_GIL_RELEASE({
     nvte_grouped_gemm(grouped_A_for_gemm.data(), transa, grouped_B_for_gemm.data(), transb,
                       grouped_C.has_value() ? grouped_C->data() : nullptr, grouped_D.data(),
-                      te_alpha.data(), te_beta.data(), te_workspace_setup.data(),
-                      te_workspace_cublas.data(),
-                      config.has_value() ? static_cast<NVTEGroupedMatmulConfig>(*config) : nullptr,
+                      gemm_config.te_alpha.data(), gemm_config.te_beta.data(),
+                      gemm_config.te_workspace_setup.data(), gemm_config.te_workspace_cublas.data(),
+                      gemm_config.matmul_config.has_value()
+                          ? static_cast<NVTEGroupedMatmulConfig>(*gemm_config.matmul_config)
+                          : nullptr,
                       at::cuda::getCurrentCUDAStream());
+  });
+
+  return py::reinterpret_borrow<py::object>(D);
+}
+
+py::object te_general_grouped_gemm_for_discrete_in(py::handle A_list, bool transa, py::handle B,
+                                                   bool transb, py::object C, py::handle D,
+                                                   at::Tensor alpha, at::Tensor beta,
+                                                   at::Tensor workspace_setup,
+                                                   at::Tensor workspace_cublas,
+                                                   int math_sm_count) {
+  using namespace transformer_engine::pytorch::detail;
+
+  init_extension();
+
+  // Ensure that cublasLt handle is created on the correct device,
+  // overriding torch.cuda.set_device calls from user side.
+  // Assumes all tensors passed are on the same device.
+  at::cuda::CUDAGuard device_guard(workspace_cublas.device());
+
+  auto grouped_B = GroupedTensorFromPyTorchGroupedTensor(B);
+  auto grouped_D = GroupedTensorFromPyTorchGroupedTensor(D);
+
+  std::optional<GroupedTensorWrapper> grouped_C = std::nullopt;
+  if (!C.is_none()) {
+    grouped_C = GroupedTensorFromPyTorchGroupedTensor(C);
+  }
+
+  auto A_seq = py::reinterpret_borrow<py::sequence>(A_list);
+  const size_t num_a_tensors = A_seq.size();
+  NVTE_CHECK(num_a_tensors > 0, "Grouped GEMM requires non-empty A_list.");
+
+  const size_t num_tensors = grouped_B.num_tensors();
+  NVTE_CHECK(num_tensors == num_a_tensors,
+             "Grouped GEMM requires A_list to have num_tensors entries.");
+  NVTE_CHECK(grouped_D.num_tensors() == num_tensors,
+             "Grouped GEMM requires D to have the same num_tensors as inputs.");
+  if (grouped_C.has_value()) {
+    NVTE_CHECK(grouped_C->num_tensors() == num_tensors,
+               "Grouped GEMM requires C to have the same num_tensors as inputs.");
+  }
+
+  std::vector<TensorWrapper> a_wrappers;
+  std::vector<NVTETensor> a_tensors;
+  a_wrappers.reserve(num_a_tensors);
+  a_tensors.reserve(num_a_tensors);
+  for (size_t i = 0; i < num_a_tensors; ++i) {
+    py::handle a_tensor = A_seq[i];
+    a_wrappers.emplace_back(makeTransformerEngineTensor(a_tensor, py::none()));
+    a_tensors.emplace_back(a_wrappers.back().data());
+  }
+
+  // Keep the swizzled scaling factor tensors alive during the GEMM.
+  std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
+
+  // Optionally swizzle the scaling factors for list inputs
+  swizzled_scale_inverses_list.emplace_back(
+      multi_tensor_swizzle_scales_for_gemm(a_wrappers, transa, !transa));
+
+  auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
+                                            num_tensors, math_sm_count);
+
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_grouped_gemm_with_discrete_in(
+        a_tensors.data(), a_tensors.size(), transa, grouped_B.data(), transb,
+        grouped_C.has_value() ? grouped_C->data() : nullptr, grouped_D.data(),
+        gemm_config.te_alpha.data(), gemm_config.te_beta.data(), gemm_config.te_workspace_setup.data(),
+        gemm_config.te_workspace_cublas.data(),
+        gemm_config.matmul_config.has_value()
+            ? static_cast<NVTEGroupedMatmulConfig>(*gemm_config.matmul_config)
+            : nullptr,
+        at::cuda::getCurrentCUDAStream());
   });
 
   return py::reinterpret_borrow<py::object>(D);
@@ -756,21 +847,6 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
   NVTE_CHECK(num_tensors > 0, "Grouped GEMM requires non-empty inputs.");
   NVTE_CHECK(grouped_B.num_tensors() == num_tensors,
              "Grouped GEMM requires A and B to have the same num_tensors.");
-
-  NVTE_CHECK(alpha.numel() == static_cast<int64_t>(num_tensors),
-             "Grouped GEMM expects alpha to have num_tensors elements.");
-  NVTE_CHECK(beta.numel() == static_cast<int64_t>(num_tensors),
-             "Grouped GEMM expects beta to have num_tensors elements.");
-
-  auto te_alpha = makeTransformerEngineTensor(alpha);
-  auto te_beta = makeTransformerEngineTensor(beta);
-
-  auto te_workspace_setup = makeTransformerEngineTensor(
-      workspace_setup.data_ptr(), std::vector<size_t>{static_cast<size_t>(workspace_setup.numel())},
-      DType::kByte);
-  auto te_workspace_cublas = makeTransformerEngineTensor(
-      workspace_cublas.data_ptr(),
-      std::vector<size_t>{static_cast<size_t>(workspace_cublas.numel())}, DType::kByte);
 
   auto D_seq = py::reinterpret_borrow<py::sequence>(D_list);
   const size_t num_d_tensors = D_seq.size();
@@ -803,19 +879,18 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
     }
   }
 
-  std::optional<transformer_engine::GroupedMatmulConfigWrapper> config;
-  if (math_sm_count > 0) {
-    config.emplace();
-    config->set_sm_count(math_sm_count);
-  }
+  auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
+                                            num_tensors, math_sm_count);
 
   NVTE_SCOPED_GIL_RELEASE({
     nvte_grouped_gemm_with_discrete_out(
         grouped_A.data(), transa, grouped_B.data(), transb,
         c_tensors.empty() ? nullptr : c_tensors.data(), c_tensors.size(), d_tensors.data(),
-        d_tensors.size(), te_alpha.data(), te_beta.data(), te_workspace_setup.data(),
-        te_workspace_cublas.data(),
-        config.has_value() ? static_cast<NVTEGroupedMatmulConfig>(*config) : nullptr,
+        d_tensors.size(), gemm_config.te_alpha.data(), gemm_config.te_beta.data(),
+        gemm_config.te_workspace_setup.data(), gemm_config.te_workspace_cublas.data(),
+        gemm_config.matmul_config.has_value()
+            ? static_cast<NVTEGroupedMatmulConfig>(*gemm_config.matmul_config)
+            : nullptr,
         at::cuda::getCurrentCUDAStream());
   });
 
