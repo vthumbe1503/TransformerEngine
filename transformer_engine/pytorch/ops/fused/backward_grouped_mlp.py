@@ -17,7 +17,6 @@ import transformer_engine_torch as tex
 from cuda.bindings import driver as cuda
 from ...cpp_extensions import (
     general_grouped_gemm_for_grouped_tensor,
-    general_grouped_gemm_for_discrete_out,
     general_grouped_gemm,
 )
 from ...module._common import noop_cat
@@ -32,7 +31,6 @@ from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
     is_quantized_tensor,
     make_grouped_tensor_from_buffers,
-    make_grouped_tensor_from_mxfp8_weights,
     maybe_dequantize,
 )
 
@@ -354,7 +352,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             # Launch GEMM
             if accumulate_into_main_grad:
                 # A=grouped_input, B=grouped_fc2_dy; B's scales are GEMM-swizzled (see group_quantize above).
-                general_grouped_gemm_for_discrete_out(
+                general_grouped_gemm_for_grouped_tensor(
                     grouped_fc2_x,
                     grouped_fc2_dy,
                     fc2_dws,
@@ -417,13 +415,6 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             # Launch GEMM
             in_shape = out_shape[:-1] + [fc1_weight_shape[1]]
             grad_input = torch.empty(in_shape, dtype=dtype, device=device)
-            grouped_fc1_w = make_grouped_tensor_from_mxfp8_weights(
-                fc1_ws,
-                fc1_ctx.weight_quantizers[0],
-                device,
-                dtype,
-                with_gemm_swizzled_scales=True,
-            )
             grouped_grad_input = make_grouped_tensor_from_buffers(
                 num_groups=num_groups,
                 data=grad_input,
@@ -432,7 +423,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 logical_last_dim=fc1_weight_shape[1],
             )
             general_grouped_gemm_for_grouped_tensor(
-                grouped_fc1_w,
+                fc1_ws,
                 grouped_fc1_dy,
                 grouped_grad_input,
                 layout="NN",
@@ -465,7 +456,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
 
             # Launch GEMM
             if accumulate_into_main_grad:
-                general_grouped_gemm_for_discrete_out(
+                general_grouped_gemm_for_grouped_tensor(
                     grouped_fc1_x,
                     grouped_fc1_dy,
                     fc1_dws,

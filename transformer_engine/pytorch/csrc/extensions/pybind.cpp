@@ -279,6 +279,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("te_general_grouped_gemm_for_grouped_tensor",
         &transformer_engine::pytorch::te_general_grouped_gemm_for_grouped_tensor,
         "Grouped GEMM for GroupedTensor");
+  m.def("te_general_grouped_gemm_for_discrete_in",
+        &transformer_engine::pytorch::te_general_grouped_gemm_for_discrete_in,
+        "Grouped GEMM with discrete input tensors");
   m.def("te_general_grouped_gemm_for_discrete_out",
         &transformer_engine::pytorch::te_general_grouped_gemm_for_discrete_out,
         "Grouped GEMM with discrete output tensors");
