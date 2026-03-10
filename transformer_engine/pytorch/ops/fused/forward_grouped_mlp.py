@@ -203,13 +203,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                     quantized_fc1_weights.append(weight)
                 else:
                     quantized_fc1_weights.append(quantizer(weight))
-            grouped_fc1_weight = make_grouped_tensor_from_mxfp8_weights(
-                quantized_fc1_weights,
-                quantizer=fc1_weight_quantizer,
-                device=device,
-                dtype=dtype,
-                with_gemm_swizzled_scales=False,
-            )
+            grouped_fc1_weight = quantized_fc1_weights
 
         # Prepare FC2 grouped weight tensor for fused kernels.
         if fc2_op.single_grouped_parameter:
@@ -242,18 +236,16 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                     quantized_fc2_weights.append(weight)
                 else:
                     quantized_fc2_weights.append(quantizer(weight))
-            grouped_fc2_weight = make_grouped_tensor_from_mxfp8_weights(
-                quantized_fc2_weights,
-                quantizer=fc2_weight_quantizer,
-                device=device,
-                dtype=dtype,
-                with_gemm_swizzled_scales=False,
-            )
+            grouped_fc2_weight = quantized_fc2_weights
 
         # Some wrapper-copy paths may drop grouped storage metadata; enforce defaults.
-        if getattr(grouped_fc1_weight, "with_gemm_swizzled_scales", None) is None:
+        if getattr(grouped_fc1_weight, "with_gemm_swizzled_scales", None) is None and isinstance(
+            grouped_fc1_weight, GroupedTensor
+        ):
             grouped_fc1_weight.with_gemm_swizzled_scales = False
-        if getattr(grouped_fc2_weight, "with_gemm_swizzled_scales", None) is None:
+        if getattr(grouped_fc2_weight, "with_gemm_swizzled_scales", None) is None and isinstance(
+            grouped_fc2_weight, GroupedTensor
+        ):
             grouped_fc2_weight.with_gemm_swizzled_scales = False
 
         # Group-quantize input tensor and convert dtypes if needed
@@ -296,11 +288,19 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (n, k, num_groups)
         # Scale logical shape: (32 (block row), 4 (block row), n/128,
         #   4 (block col), k/128, num_groups)
-        fc1_w_data = grouped_fc1_weight.rowwise_data
+        fc1_w_data = (
+            grouped_fc1_weight.rowwise_data
+            if fc1_op.single_grouped_parameter
+            else noop_cat([w._rowwise_data for w in grouped_fc1_weight])
+        )
         fc1_w_data = fc1_w_data.view(dtype=torch.float8_e4m3fn)
         fc1_w_data = fc1_w_data.view(num_groups, fc1_weight_shape[0], fc1_weight_shape[1])
         fc1_w_data = fc1_w_data.permute(1, 2, 0)
-        fc1_w_scales = grouped_fc1_weight.scale_inv
+        fc1_w_scales = (
+            grouped_fc1_weight.scale_inv
+            if fc1_op.single_grouped_parameter
+            else noop_cat([w._rowwise_scale_inv for w in grouped_fc1_weight])
+        )
         fc1_w_scales = fc1_w_scales.view(dtype=torch.float8_e8m0fnu)
         fc1_w_scales = fc1_w_scales.view(
             num_groups, fc1_weight_shape[0] // 128, 4, 32, fc1_weight_shape[1] // 128, 4
@@ -416,9 +416,14 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             else:
                 fc1_input_tensors = (None, None, None, None, None)
             # FC1
-            fc1_ctx.save_for_backward(
-                split_sizes, split_points, grouped_fc1_weight, *fc1_input_tensors
-            )
+            if fc1_op.single_grouped_parameter:
+                fc1_ctx.save_for_backward(
+                    split_sizes, split_points, grouped_fc1_weight, *fc1_input_tensors
+                )
+            else:
+                fc1_ctx.save_for_backward(
+                    split_sizes, split_points, *grouped_fc1_weight, *fc1_input_tensors
+                )
             fc1_ctx.with_quantized_compute = True
             fc1_ctx.input_quantizers = fc1_input_quantizers
             fc1_ctx.weight_quantizer = fc1_weight_quantizer
@@ -451,7 +456,12 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 )
             else:
                 fc2_input_tensors = (None, None, None, None, None)
-            fc2_ctx.save_for_backward(split_sizes, grouped_fc2_weight, *fc2_input_tensors)
+
+            if fc2_op.single_grouped_parameter:
+                fc2_ctx.save_for_backward(split_sizes, grouped_fc2_weight, *fc2_input_tensors)
+            else:
+                fc2_ctx.save_for_backward(split_sizes, *grouped_fc2_weight, *fc2_input_tensors)
+
             fc2_ctx.with_quantized_compute = True
             fc2_ctx.input_quantizers = fc2_input_quantizers
             fc2_ctx.weight_quantizer = fc2_weight_quantizer

@@ -18,7 +18,6 @@ import transformer_engine_torch as tex
 from cuda.bindings import driver as cuda
 from ...cpp_extensions import (
     general_grouped_gemm_for_grouped_tensor,
-    general_grouped_gemm_for_discrete_out,
 )
 from ...module._common import noop_cat
 from ...module.base import get_dummy_wgrad
@@ -137,7 +136,15 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             saved_tensors[1],
             saved_tensors[2:],
         )
-        grouped_fc1_weight, saved_tensors = saved_tensors[0], saved_tensors[1:]
+
+        if fc1_op.single_grouped_parameter:
+            grouped_fc1_weight, saved_tensors = saved_tensors[0], saved_tensors[1:]
+        else:
+            grouped_fc1_weight, saved_tensors = (
+                saved_tensors[:num_groups],
+                saved_tensors[num_groups:],
+            )
+
         (
             fc1_x_data,
             fc1_x_col_data,
@@ -155,7 +162,14 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Saved tensors from FC2 forward
         saved_tensors = fc2_ctx.saved_tensors
         _, saved_tensors = saved_tensors[0], saved_tensors[1:]  # Assume same split sizes as FC1
-        grouped_fc2_weight, saved_tensors = saved_tensors[0], saved_tensors[1:]
+        if fc2_op.single_grouped_parameter:
+            grouped_fc2_weight, saved_tensors = saved_tensors[0], saved_tensors[1:]
+        else:
+            grouped_fc2_weight, saved_tensors = (
+                saved_tensors[:num_groups],
+                saved_tensors[num_groups:],
+            )
+
         (
             fc2_x_data,
             fc2_x_col_data,
@@ -247,11 +261,19 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # Data logical shape: (n, k, num_groups)
         # Scale logical shape: (32 (block col), 4 (block col), n/128,
         #   4 (block row), k/128, num_groups)
-        fc2_w_data = grouped_fc2_weight.columnwise_data
+        fc2_w_data = (
+            grouped_fc2_weight.columnwise_data
+            if fc2_op.single_grouped_parameter
+            else noop_cat([w._columnwise_data for w in grouped_fc2_weight])
+        )
         fc2_w_data = fc2_w_data.view(dtype=torch.float8_e4m3fn)
         fc2_w_data = fc2_w_data.view(num_groups, fc2_weight_shape[0], fc2_weight_shape[1])
         fc2_w_data = fc2_w_data.permute(2, 1, 0)
-        fc2_w_scales = grouped_fc2_weight.columnwise_scale_inv
+        fc2_w_scales = (
+            grouped_fc2_weight.columnwise_scale_inv
+            if fc2_op.single_grouped_parameter
+            else noop_cat([w._columnwise_scale_inv for w in grouped_fc2_weight])
+        )
         fc2_w_scales = fc2_w_scales.view(dtype=torch.float8_e8m0fnu)
         fc2_w_scales = fc2_w_scales.view(
             num_groups, fc2_weight_shape[0] // 128, 4, fc2_weight_shape[1] // 128, 4, 32
@@ -421,7 +443,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                             fc2_weight_shape, dtype=dtype, device=device
                         )
 
-                general_grouped_gemm_for_discrete_out(
+                general_grouped_gemm_for_grouped_tensor(
                     grouped_fc2_x,
                     grouped_fc2_dy,
                     fc2_weight_grads,
@@ -563,7 +585,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                             fc1_weight_shape, dtype=dtype, device=device
                         )
 
-                general_grouped_gemm_for_discrete_out(
+                general_grouped_gemm_for_grouped_tensor(
                     grouped_fc1_x,
                     grouped_fc1_dy,
                     fc1_weight_grads,
