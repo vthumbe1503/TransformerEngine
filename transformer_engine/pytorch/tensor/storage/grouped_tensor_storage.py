@@ -387,6 +387,69 @@ class GroupedTensorStorage:
         )
 
     @staticmethod
+    def make_grouped_tensor_from_rowwise_data(
+        *,
+        num_tensors: int,
+        tensor_shape: Tuple[int, int],
+        rowwise_data: torch.Tensor,
+        dtype: Optional[torch.dtype] = None,
+        internal: bool = False,
+    ) -> GroupedTensorStorage:
+        """Wrap pre-existing contiguous rowwise data as a grouped tensor.
+
+        This helper does not allocate storage. It creates grouped metadata over
+        `rowwise_data`, which is expected to contain `num_tensors` matrices of
+        shape `tensor_shape` in packed contiguous layout.
+        """
+        if num_tensors <= 0:
+            raise ValueError(f"num_tensors must be positive, got {num_tensors}")
+        if rowwise_data is None:
+            raise ValueError("rowwise_data must not be None")
+        if not rowwise_data.is_contiguous():
+            rowwise_data = rowwise_data.contiguous()
+
+        rows, cols = tensor_shape
+        expected_numel = num_tensors * rows * cols
+        if rowwise_data.numel() != expected_numel:
+            raise ValueError(
+                "Grouped rowwise buffer size mismatch: expected "
+                f"{expected_numel} elements for {num_tensors}x{tensor_shape}, "
+                f"but got {rowwise_data.numel()}"
+            )
+        if dtype is None:
+            dtype = rowwise_data.dtype
+
+        logical_shape = (num_tensors * rows, cols)
+        grouped_tensor_class = GroupedTensorStorage
+        if not internal:
+            from ..grouped_tensor import GroupedTensor
+
+            grouped_tensor_class = GroupedTensor
+
+        return grouped_tensor_class(
+            shape=logical_shape,
+            dtype=dtype,
+            num_tensors=num_tensors,
+            shapes=[tensor_shape] * num_tensors,
+            quantizer=None,
+            data=rowwise_data.view(-1),
+            columnwise_data=None,
+            scale_inv=None,
+            columnwise_scale_inv=None,
+            amax=None,
+            columnwise_amax=None,
+            scale=None,
+            first_dims=None,
+            last_dims=None,
+            tensor_offsets=None,
+            offsets=None,
+            scale_inv_offsets=None,
+            columnwise_scale_inv_offsets=None,
+            with_gemm_swizzled_scales=False,
+            requires_grad=False,
+        )
+
+    @staticmethod
     def make_tensor_offsets(first_dims: torch.Tensor, logical_last_dim: int) -> torch.Tensor:
         return torch.cat(
             [
@@ -1011,3 +1074,4 @@ class GroupedTensorStorage:
         for i in range(self.num_tensors):
             self.quantizer.update_quantized(tensors[i], quantized_tensors[i], noop_flag=noop_flag)
         return quantized_tensors
+
