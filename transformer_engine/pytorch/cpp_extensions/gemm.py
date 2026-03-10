@@ -338,8 +338,10 @@ def general_grouped_gemm_for_grouped_tensor(
     if alpha is None:
         alpha = torch.ones(num_tensors, dtype=torch.float32, device=device)
     if beta is None:
-        beta = torch.ones(num_tensors, dtype=torch.float32, device=device) if accumulate else torch.zeros(
-            num_tensors, dtype=torch.float32, device=device
+        beta = (
+            torch.ones(num_tensors, dtype=torch.float32, device=device)
+            if accumulate
+            else torch.zeros(num_tensors, dtype=torch.float32, device=device)
         )
     if not alpha.is_cuda or not beta.is_cuda:
         raise ValueError("alpha and beta must be CUDA tensors.")
@@ -370,5 +372,3 @@ def general_grouped_gemm_for_grouped_tensor(
         workspace_cublas,
         sm_count,
     )
-
-

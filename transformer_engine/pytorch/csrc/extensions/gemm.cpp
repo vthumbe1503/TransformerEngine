@@ -96,9 +96,9 @@ GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
   GroupedGemmConfig grouped_gemm_config{
       makeTransformerEngineTensor(alpha),
       makeTransformerEngineTensor(beta),
-      makeTransformerEngineTensor(
-          workspace_setup.data_ptr(),
-          std::vector<size_t>{static_cast<size_t>(workspace_setup.numel())}, DType::kByte),
+      makeTransformerEngineTensor(workspace_setup.data_ptr(),
+                                  std::vector<size_t>{static_cast<size_t>(workspace_setup.numel())},
+                                  DType::kByte),
       makeTransformerEngineTensor(
           workspace_cublas.data_ptr(),
           std::vector<size_t>{static_cast<size_t>(workspace_cublas.numel())}, DType::kByte),
@@ -117,7 +117,7 @@ GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
 
 namespace {
 
-bool is_empty_grouped_tensor_param(const NVTEBasicTensor &t) {
+bool is_empty_grouped_tensor_param(const NVTEBasicTensor& t) {
   return t.shape.ndim == 1 && t.shape.data[0] == 0;
 }
 
@@ -128,7 +128,7 @@ struct SwizzledGroupedTensor {
 };
 
 std::optional<SwizzledGroupedTensor> maybe_swizzle_grouped_tensor_for_gemm(
-    const GroupedTensorWrapper &input) {
+    const GroupedTensorWrapper& input) {
   if (input.scaling_mode() != NVTE_MXFP8_1D_SCALING) {
     return std::nullopt;
   }
@@ -183,13 +183,13 @@ std::optional<SwizzledGroupedTensor> maybe_swizzle_grouped_tensor_for_gemm(
   if (has_rowwise_scales) {
     const auto scales_dtype = static_cast<DType>(row_scales.dtype);
     rowwise_scales_pyt = allocateSpace(row_scales.shape, scales_dtype, false);
-    void *output_scales_dptr = getDataPtr(*rowwise_scales_pyt);
+    void* output_scales_dptr = getDataPtr(*rowwise_scales_pyt);
     output.set_rowwise_scale_inv(output_scales_dptr, scales_dtype, row_scales.shape);
   }
   if (has_columnwise_scales) {
     const auto scales_dtype = static_cast<DType>(col_scales.dtype);
     columnwise_scales_pyt = allocateSpace(col_scales.shape, scales_dtype, false);
-    void *output_scales_dptr = getDataPtr(*columnwise_scales_pyt);
+    void* output_scales_dptr = getDataPtr(*columnwise_scales_pyt);
     output.set_columnwise_scale_inv(output_scales_dptr, scales_dtype, col_scales.shape);
   }
 
@@ -730,13 +730,13 @@ py::object te_general_grouped_gemm_for_grouped_tensor(py::handle A, bool transa,
   }
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                            num_tensors, math_sm_count);
+                                                 num_tensors, math_sm_count);
 
   auto grouped_A_swizzled = maybe_swizzle_grouped_tensor_for_gemm(grouped_A);
   auto grouped_B_swizzled = maybe_swizzle_grouped_tensor_for_gemm(grouped_B);
-  auto &grouped_A_for_gemm =
+  auto& grouped_A_for_gemm =
       grouped_A_swizzled.has_value() ? grouped_A_swizzled->tensor : grouped_A;
-  auto &grouped_B_for_gemm =
+  auto& grouped_B_for_gemm =
       grouped_B_swizzled.has_value() ? grouped_B_swizzled->tensor : grouped_B;
 
   NVTE_SCOPED_GIL_RELEASE({
@@ -757,8 +757,7 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A_list, bool trans
                                                    bool transb, py::object C, py::handle D,
                                                    at::Tensor alpha, at::Tensor beta,
                                                    at::Tensor workspace_setup,
-                                                   at::Tensor workspace_cublas,
-                                                   int math_sm_count) {
+                                                   at::Tensor workspace_cublas, int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
   init_extension();
@@ -808,14 +807,14 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A_list, bool trans
       multi_tensor_swizzle_scales_for_gemm(a_wrappers, transa, !transa));
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                            num_tensors, math_sm_count);
+                                                 num_tensors, math_sm_count);
 
   NVTE_SCOPED_GIL_RELEASE({
     nvte_grouped_gemm_with_discrete_in(
         a_tensors.data(), a_tensors.size(), transa, grouped_B.data(), transb,
         grouped_C.has_value() ? grouped_C->data() : nullptr, grouped_D.data(),
-        gemm_config.te_alpha.data(), gemm_config.te_beta.data(), gemm_config.te_workspace_setup.data(),
-        gemm_config.te_workspace_cublas.data(),
+        gemm_config.te_alpha.data(), gemm_config.te_beta.data(),
+        gemm_config.te_workspace_setup.data(), gemm_config.te_workspace_cublas.data(),
         gemm_config.matmul_config.has_value()
             ? static_cast<NVTEGroupedMatmulConfig>(*gemm_config.matmul_config)
             : nullptr,
@@ -880,7 +879,7 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
   }
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                            num_tensors, math_sm_count);
+                                                 num_tensors, math_sm_count);
 
   NVTE_SCOPED_GIL_RELEASE({
     nvte_grouped_gemm_with_discrete_out(

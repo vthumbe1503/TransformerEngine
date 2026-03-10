@@ -273,7 +273,7 @@ class GroupedLinear(BasicOperation):
             quantizer is None or not quantizer.internal
         ), "Found internal quantizer with `single_grouped_parameter=True`."
 
-         # Re-register as a single grouped weight parameter.
+        # Re-register as a single grouped weight parameter.
         self.register_parameter("weight", torch.nn.Parameter(grouped_weights))
         for group_idx in range(self.num_groups):
             self.register_parameter(f"weight{group_idx}", None)
@@ -384,7 +384,8 @@ class GroupedLinear(BasicOperation):
                 weight = getattr(self, f"weight{group_idx}")
                 if weight.dtype != dtype:
                     raise RuntimeError(
-                        f"Weight {group_idx} has invalid dtype (expected {dtype}, got {weight.dtype})."
+                        f"Weight {group_idx} has invalid dtype (expected {dtype}, got"
+                        f" {weight.dtype})."
                     )
                 if not devices_match(weight.device, device):
                     raise RuntimeError(
@@ -436,7 +437,11 @@ class GroupedLinear(BasicOperation):
         super().pre_fuser_forward(requires_grad=requires_grad)
         if FP8GlobalStateManager.is_fp8_enabled():
             # Assume weights have consistent grad requirement
-            weight_requires_grad = self.weight.requires_grad if self.single_grouped_parameter else self.weight0.requires_grad
+            weight_requires_grad = (
+                self.weight.requires_grad
+                if self.single_grouped_parameter
+                else self.weight0.requires_grad
+            )
             weight_requires_grad = requires_grad and weight_requires_grad
 
             # Configure quantizer usages
@@ -540,7 +545,6 @@ class GroupedLinear(BasicOperation):
         ctx = basic_op_ctxs[0]
         input_requires_grad = ctx.requires_grad
         weight_requires_grad = ctx.requires_grad and weight_param.requires_grad
-
 
         # Quantizers
         input_quantizers = [None] * num_groups
@@ -719,14 +723,18 @@ class GroupedLinear(BasicOperation):
                                 )
                             main_grad = main_grad.reshape(grouped_shape)
                         grad_weights = [main_grad[idx] for idx in range(num_groups)]
-                    accumulate_into_main_grad = not getattr(weight_param, "overwrite_main_grad", False)
+                    accumulate_into_main_grad = not getattr(
+                        weight_param, "overwrite_main_grad", False
+                    )
                 else:
                     for group_idx in range(num_groups):
                         weight_param = getattr(self, f"weight{group_idx}")
                         if hasattr(weight_param, "__fsdp_param__"):
                             weight_param.main_grad = weight_param.get_main_grad()
                         grad_weights[group_idx] = weight_param.main_grad
-                    accumulate_into_main_grad = not getattr(self.weight0, "overwrite_main_grad", False)
+                    accumulate_into_main_grad = not getattr(
+                        self.weight0, "overwrite_main_grad", False
+                    )
             else:
                 weight_shape = (self.out_features, self.in_features)
                 for group_idx in range(num_groups):
@@ -816,4 +824,3 @@ class GroupedLinear(BasicOperation):
         else:
             grad_params = grad_weights + grad_biases if has_bias else grad_weights
         return grad_input, [grad_params], [(None,)]
-

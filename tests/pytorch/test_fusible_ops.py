@@ -3486,8 +3486,12 @@ class TestSequentialModules:
             assert_close_grads(getattr(fc2, f"bias{group_idx}"), fc2_bs_ref[group_idx], **tols)
             assert_close_grads(getattr(fc1, f"bias{group_idx}"), fc1_bs_ref[group_idx], **tols)
             if not single_grouped_parameter and not accumulate_into_main_grad:
-                assert_close_grads(getattr(fc2, f"weight{group_idx}"), fc2_ws_ref[group_idx], **tols)
-                assert_close_grads(getattr(fc1, f"weight{group_idx}"), fc1_ws_ref[group_idx], **tols)
+                assert_close_grads(
+                    getattr(fc2, f"weight{group_idx}"), fc2_ws_ref[group_idx], **tols
+                )
+                assert_close_grads(
+                    getattr(fc1, f"weight{group_idx}"), fc1_ws_ref[group_idx], **tols
+                )
         fc1_w_ref_grad = torch.stack([w.grad for w in fc1_ws_ref], dim=0)
         fc2_w_ref_grad = torch.stack([w.grad for w in fc2_ws_ref], dim=0)
         if accumulate_into_main_grad:
@@ -4175,4 +4179,3 @@ class TestCustomOps:
         torch.testing.assert_close(y_test, y_ref, **tols)
         torch.testing.assert_close(dx_test, x_ref.grad, **tols)
         torch.testing.assert_close(dw_test, w_ref.grad, **tols)
-

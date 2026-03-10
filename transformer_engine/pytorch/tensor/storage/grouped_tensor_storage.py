@@ -1074,4 +1074,3 @@ class GroupedTensorStorage:
         for i in range(self.num_tensors):
             self.quantizer.update_quantized(tensors[i], quantized_tensors[i], noop_flag=noop_flag)
         return quantized_tensors
-

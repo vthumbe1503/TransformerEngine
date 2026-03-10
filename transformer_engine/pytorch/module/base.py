@@ -80,7 +80,7 @@ class UserBufferQuantizationMode(Enum):
 
 def get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
     """Returns a dummy tensor of given shape."""
-    
+
     key = (*shape, dtype)
     global _dummy_wgrads
     if key not in _dummy_wgrads:

@@ -160,8 +160,7 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A_list, bool trans
                                                    bool transb, py::object C, py::handle D,
                                                    at::Tensor alpha, at::Tensor beta,
                                                    at::Tensor workspace_setup,
-                                                   at::Tensor workspace_cublas,
-                                                   int math_sm_count);
+                                                   at::Tensor workspace_cublas, int math_sm_count);
 
 py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, py::handle B,
                                                     bool transb, py::object C_list,

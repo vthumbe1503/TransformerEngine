@@ -361,9 +361,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                             main_grad = main_grad.view(grouped_shape)
                         except RuntimeError as e:
                             raise RuntimeError(
-                                "Grouped MLP fused backward requires FC2 main_grad to be viewable as "
-                                f"{grouped_shape} without copy, but got shape {tuple(main_grad.shape)} "
-                                f"and stride {tuple(main_grad.stride())}"
+                                "Grouped MLP fused backward requires FC2 main_grad to be viewable"
+                                f" as {grouped_shape} without copy, but got shape"
+                                f" {tuple(main_grad.shape)} and stride {tuple(main_grad.stride())}"
                             ) from e
                     accumulate_into_main_grad = not getattr(
                         weight_param, "overwrite_main_grad", False
@@ -395,7 +395,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                     layout="NT",
                     accumulate=accumulate_into_main_grad,
                 )
-                fc2_packed_wgrad = grouped_fc2_wgrad.rowwise_data.view(num_groups, *fc2_weight_shape)
+                fc2_packed_wgrad = grouped_fc2_wgrad.rowwise_data.view(
+                    num_groups, *fc2_weight_shape
+                )
                 if accumulate_into_main_grad and hasattr(weight_param, "grad_added_to_main_grad"):
                     weight_param.grad_added_to_main_grad = True
                     fc2_packed_wgrad = get_dummy_wgrad(
@@ -410,10 +412,14 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         if hasattr(weight_param, "__fsdp_param__"):
                             weight_param.main_grad = weight_param.get_main_grad()
                         fc2_weight_grads[idx] = weight_param.main_grad
-                    accumulate_into_main_grad = not getattr(fc2_op.weight0, "overwrite_main_grad", False)
+                    accumulate_into_main_grad = not getattr(
+                        fc2_op.weight0, "overwrite_main_grad", False
+                    )
                 else:
                     for idx in range(num_groups):
-                        fc2_weight_grads[idx] = torch.empty(fc2_weight_shape, dtype=dtype, device=device)
+                        fc2_weight_grads[idx] = torch.empty(
+                            fc2_weight_shape, dtype=dtype, device=device
+                        )
 
                 general_grouped_gemm_for_discrete_out(
                     grouped_fc2_x,
@@ -498,9 +504,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                             main_grad = main_grad.view(grouped_shape)
                         except RuntimeError as e:
                             raise RuntimeError(
-                                "Grouped MLP fused backward requires FC1 main_grad to be viewable as "
-                                f"{grouped_shape} without copy, but got shape {tuple(main_grad.shape)} "
-                                f"and stride {tuple(main_grad.stride())}"
+                                "Grouped MLP fused backward requires FC1 main_grad to be viewable"
+                                f" as {grouped_shape} without copy, but got shape"
+                                f" {tuple(main_grad.shape)} and stride {tuple(main_grad.stride())}"
                             ) from e
                     accumulate_into_main_grad = not getattr(
                         weight_param, "overwrite_main_grad", False
@@ -531,7 +537,9 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                     layout="NT",
                     accumulate=accumulate_into_main_grad,
                 )
-                fc1_packed_wgrad = grouped_fc1_wgrad.rowwise_data.view(num_groups, *fc1_weight_shape)
+                fc1_packed_wgrad = grouped_fc1_wgrad.rowwise_data.view(
+                    num_groups, *fc1_weight_shape
+                )
                 if accumulate_into_main_grad and hasattr(weight_param, "grad_added_to_main_grad"):
                     weight_param.grad_added_to_main_grad = True
                     fc1_packed_wgrad = get_dummy_wgrad(
@@ -546,10 +554,14 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         if hasattr(weight_param, "__fsdp_param__"):
                             weight_param.main_grad = weight_param.get_main_grad()
                         fc1_weight_grads[idx] = weight_param.main_grad
-                    accumulate_into_main_grad = not getattr(fc1_op.weight0, "overwrite_main_grad", False)
+                    accumulate_into_main_grad = not getattr(
+                        fc1_op.weight0, "overwrite_main_grad", False
+                    )
                 else:
                     for idx in range(num_groups):
-                        fc1_weight_grads[idx] = torch.empty(fc1_weight_shape, dtype=dtype, device=device)
+                        fc1_weight_grads[idx] = torch.empty(
+                            fc1_weight_shape, dtype=dtype, device=device
+                        )
 
                 general_grouped_gemm_for_discrete_out(
                     grouped_fc1_x,
@@ -584,7 +596,11 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         if fc2_op.single_grouped_parameter:
             fc2_weight_grads = [fc2_packed_wgrad] if fc2_packed_wgrad is not None else [None]
 
-        return grad_input, [fc1_weight_grads, (), fc2_weight_grads], [(None,), (grad_scales,), (None,)]
+        return (
+            grad_input,
+            [fc1_weight_grads, (), fc2_weight_grads],
+            [(None,), (grad_scales,), (None,)],
+        )
 
     def _get_kernel_constants(
         self,
@@ -696,4 +712,3 @@ def fuse_backward_ops(
 # Register fusion if available
 if BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8.is_supported():
     register_backward_fusion(fuse_backward_ops, prepend=True)
-
