@@ -197,12 +197,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             quantized_fc1_weights = []
             for idx, weight in enumerate(fc1_weights):
                 quantizer = fc1_op.get_quantizer("forward", 2 * idx + 1)
-                quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                if is_quantized_tensor(weight):
-                    weight.update_usage(rowwise_usage=True, columnwise_usage=input_requires_grad)
-                    quantized_fc1_weights.append(weight)
-                else:
+                if not is_quantized_tensor(weight):
+                    quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
                     quantized_fc1_weights.append(quantizer(weight))
+                else:
+                    quantized_fc1_weights.append(weight)
             grouped_fc1_weight = quantized_fc1_weights
 
         # Prepare FC2 grouped weight tensor for fused kernels.
@@ -231,11 +230,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             for idx, weight in enumerate(fc2_weights):
                 quantizer = fc2_op.get_quantizer("forward", 2 * idx + 1)
                 quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                if is_quantized_tensor(weight):
-                    weight.update_usage(rowwise_usage=True, columnwise_usage=input_requires_grad)
-                    quantized_fc2_weights.append(weight)
-                else:
+                if not is_quantized_tensor(weight):
+                    quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
                     quantized_fc2_weights.append(quantizer(weight))
+                else:
+                    quantized_fc2_weights.append(weight)
             grouped_fc2_weight = quantized_fc2_weights
 
         # Some wrapper-copy paths may drop grouped storage metadata; enforce defaults.
