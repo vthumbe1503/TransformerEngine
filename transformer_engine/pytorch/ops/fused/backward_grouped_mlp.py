@@ -25,6 +25,7 @@ from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
 from ...utils import clear_tensor_data, get_device_compute_capability
+from ...constants import MXFP8_BLOCK_SCALING_SIZE
 from ..basic import GroupedLinear, ScaledSwiGLU
 from ..fuser import register_backward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
@@ -49,6 +50,14 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         from cudnn import grouped_gemm_dswiglu_wrapper_sm100  # pylint: disable=no-name-in-module
 
         return grouped_gemm_dswiglu_wrapper_sm100
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
+    def grouped_gemm_quant_kernel(cls) -> Callable:
+        """Grouped GEMM quant kernel for block-scaled inputs."""
+        from cudnn import grouped_gemm_quant_wrapper_sm100  # pylint: disable=no-name-in-module
+
+        return grouped_gemm_quant_wrapper_sm100
 
     @classmethod
     @functools.lru_cache(maxsize=None)
@@ -473,24 +482,77 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         # FC1 dgrad GEMM
         grad_input = None
         if fc1_ctx.input_requires_grad:
-            # Launch GEMM
             in_shape = out_shape[:-1] + [fc1_weight_shape[1]]
-            grad_input = torch.empty(in_shape, dtype=dtype, device=device)
-            grouped_grad_input = make_grouped_tensor_from_buffers(
-                num_groups=num_groups,
-                data=grad_input,
-                split_sizes=split_sizes,
-                dtype=grad_input.dtype,
-                logical_last_dim=fc1_weight_shape[1],
-            )
 
-            general_grouped_gemm_for_grouped_tensor(
-                grouped_fc1_weight,
-                grouped_fc1_dy,
-                grouped_grad_input,
-                layout="NN",
-                accumulate=False,
-            )
+            if fc1_op.single_grouped_parameter:
+                fc1_dgrad_a_data = fc2_dgrad_kernel_out["d_row_tensor"]
+                fc1_dgrad_a_scales = fc2_dgrad_kernel_out["sfd_row_tensor"]
+
+                fc1_w_data = grouped_fc1_weight.columnwise_data
+                fc1_w_data = fc1_w_data.view(dtype=torch.float8_e4m3fn)
+                fc1_w_data = fc1_w_data.view(
+                    num_groups, fc1_weight_shape[0], fc1_weight_shape[1]
+                )
+                fc1_w_data = fc1_w_data.permute(2, 1, 0)
+                fc1_w_data = fc1_w_data.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+
+                fc1_w_scales = grouped_fc1_weight.columnwise_scale_inv
+                fc1_w_scales = fc1_w_scales.view(dtype=torch.float8_e8m0fnu)
+                fc1_w_scales = fc1_w_scales.view(
+                    num_groups,
+                    fc1_weight_shape[0] // 128,
+                    4,
+                    fc1_weight_shape[1] // 128,
+                    4,
+                    32,
+                )
+                fc1_w_scales = fc1_w_scales.permute(
+                    0, 3, 1, 5, 4, 2
+                ).contiguous()
+                fc1_w_scales = fc1_w_scales.permute(3, 4, 1, 5, 2, 0)
+
+                fc1_dgrad_kernel_out = self.grouped_gemm_quant_kernel()(
+                    fc1_dgrad_a_data,
+                    fc1_w_data,
+                    fc1_dgrad_a_scales,
+                    fc1_w_scales,
+                    split_points,
+                    alpha_tensor.float(),
+                    norm_const_tensor=None,
+                    prob_tensor=torch.ones(
+                        (out_shape[0], 1, 1), dtype=torch.float32, device=device
+                    ),
+                    acc_dtype=torch.float32,
+                    c_dtype=dtype,
+                    d_dtype=dtype,
+                    cd_major="n",
+                    sf_vec_size=MXFP8_BLOCK_SCALING_SIZE,
+                    current_stream=current_stream,
+                    discrete_col_sfd=True,
+                )
+                grad_input = (
+                    fc1_dgrad_kernel_out["d_tensor"]
+                    .permute(2, 0, 1)
+                    .view(in_shape)
+                    .contiguous()
+                )
+            else:
+                grad_input = torch.empty(in_shape, dtype=dtype, device=device)
+                grouped_grad_input = make_grouped_tensor_from_buffers(
+                    num_groups=num_groups,
+                    data=grad_input,
+                    split_sizes=split_sizes,
+                    dtype=grad_input.dtype,
+                    logical_last_dim=fc1_weight_shape[1],
+                )
+
+                general_grouped_gemm_for_grouped_tensor(
+                    grouped_fc1_weight,
+                    grouped_fc1_dy,
+                    grouped_grad_input,
+                    layout="NN",
+                    accumulate=False,
+                )
 
         # FC1 wgrad GEMM
         fc1_packed_wgrad = None

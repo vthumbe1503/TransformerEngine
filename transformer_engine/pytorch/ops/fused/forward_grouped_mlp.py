@@ -48,6 +48,14 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
 
     @classmethod
     @functools.lru_cache(maxsize=None)
+    def grouped_gemm_quant_kernel(cls) -> Callable:
+        """Grouped GEMM quant kernel for block-scaled inputs."""
+        from cudnn import grouped_gemm_quant_wrapper_sm100  # pylint: disable=no-name-in-module
+
+        return grouped_gemm_quant_wrapper_sm100
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
     def is_supported(cls) -> bool:
         """Whether this fused operation is supported on the current system."""
         if get_device_compute_capability() < (10, 0):
@@ -376,22 +384,73 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
 
         # FC2 GEMM
         fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
-        fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
-        grouped_fc2_out = make_grouped_tensor_from_buffers(
-            num_groups=num_groups,
-            data=fc2_out,
-            split_sizes=split_sizes,
-            dtype=fc2_out.dtype,
-            logical_last_dim=fc2_weight_shape[0],
-        )
+        if fc2_op.single_grouped_parameter:
+            fc2_a_data = fc1_kernel_out["d_tensor"]
+            fc2_a_scales = fc1_kernel_out["sfd_row_tensor"]
 
-        general_grouped_gemm_for_grouped_tensor(
-            grouped_fc2_weight,
-            grouped_fc2_x,
-            grouped_fc2_out,
-            layout="TN",
-            accumulate=False,
-        )
+            fc2_w_data = grouped_fc2_weight.rowwise_data
+            fc2_w_data = fc2_w_data.view(dtype=torch.float8_e4m3fn)
+            fc2_w_data = fc2_w_data.view(num_groups, fc2_weight_shape[0], fc2_weight_shape[1])
+            fc2_w_data = fc2_w_data.permute(1, 2, 0)
+            fc2_w_data = fc2_w_data.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+
+            fc2_w_scales = grouped_fc2_weight.scale_inv
+            fc2_w_scales = fc2_w_scales.view(dtype=torch.float8_e8m0fnu)
+            fc2_w_scales = fc2_w_scales.view(
+                num_groups,
+                fc2_weight_shape[0] // 128,
+                4,
+                32,
+                fc2_weight_shape[1] // 128,
+                4,
+            )
+            fc2_w_scales = fc2_w_scales.permute(
+                0, 1, 4, 3, 2, 5
+            ).contiguous()
+            fc2_w_scales = fc2_w_scales.permute(3, 4, 1, 5, 2, 0)
+
+            fc2_kernel_out = self.grouped_gemm_quant_kernel()(
+                fc2_a_data,
+                fc2_w_data,
+                fc2_a_scales,
+                fc2_w_scales,
+                split_points,
+                alpha_tensor.float(),
+                norm_const_tensor=None,
+                prob_tensor=torch.ones(
+                    (in_shape[0], 1, 1), dtype=torch.float32, device=device
+                ),
+                acc_dtype=torch.float32,
+                c_dtype=dtype,
+                d_dtype=dtype,
+                cd_major="n",
+                sf_vec_size=MXFP8_BLOCK_SCALING_SIZE,
+                current_stream=current_stream,
+                discrete_col_sfd=True,
+            )
+            fc2_out = (
+                fc2_kernel_out["d_tensor"]
+                .permute(2, 0, 1)
+                .view(fc2_out_shape)
+                .contiguous()
+            )
+        else:
+            fc2_out = torch.empty(fc2_out_shape, dtype=dtype, device=device)
+            grouped_fc2_out = make_grouped_tensor_from_buffers(
+                num_groups=num_groups,
+                data=fc2_out,
+                split_sizes=split_sizes,
+                dtype=fc2_out.dtype,
+                logical_last_dim=fc2_weight_shape[0],
+            )
+
+            general_grouped_gemm_for_grouped_tensor(
+                grouped_fc2_weight,
+                grouped_fc2_x,
+                grouped_fc2_out,
+                layout="TN",
+                accumulate=False,
+            )
 
         # Prepare input tensors for backward pass
         if not weight_requires_grad:
