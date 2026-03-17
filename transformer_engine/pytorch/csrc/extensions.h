@@ -454,6 +454,9 @@ size_t get_cublasLt_version();
 
 size_t get_cudnn_version();
 
+std::vector<at::Tensor> convert_host_pointers_to_tensor(
+    std::vector<std::vector<at::Tensor>> tensor_lists);
+
 /***************************************************************************************************
  * Support THD format for Context Parallel
  **************************************************************************************************/

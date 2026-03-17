@@ -454,6 +454,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Get cublasLt version", py::call_guard<py::gil_scoped_release>());
   m.def("get_cudnn_version", &transformer_engine::pytorch::get_cudnn_version, "Get cuDNN version",
         py::call_guard<py::gil_scoped_release>());
+  m.def("convert_host_pointers_to_tensor",
+        &transformer_engine::pytorch::convert_host_pointers_to_tensor,
+        "Copy host-side device pointers into device tensors", py::arg("tensor_lists"));
   m.def("get_num_cublas_streams", &nvte_get_num_compute_streams, "Get number of compute streams",
         py::call_guard<py::gil_scoped_release>());
 
