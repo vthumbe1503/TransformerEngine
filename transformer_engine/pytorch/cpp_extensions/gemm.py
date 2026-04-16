@@ -13,6 +13,11 @@ import transformer_engine_torch as tex
 from ..constants import TE_DType
 from ..utils import get_sm_count, _empty_tensor
 
+@functools.lru_cache(maxsize=8)
+def _get_empty_bias_scale(device: torch.device) -> torch.Tensor:
+    return torch.empty(0, dtype=torch.float32, device=device)
+
+
 from ..quantized_tensor import Quantizer
 from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..tensor.utils import is_custom
@@ -400,7 +405,7 @@ def general_grouped_gemm_for_grouped_tensor(
     sm_count = sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))
 
     if bias_scale is None:
-        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+        bias_scale = _get_empty_bias_scale(device)
 
     return grouped_gemm_impl(
         A,

@@ -332,20 +332,20 @@ struct GroupedOperandSelection {
   bool trans = false;
 };
 
-constexpr int kMaxTensorsPerKernel = 64;
+constexpr int kMaxGroups = 64;
 // Arguments for the grouped GEMM kernel that operates on multiple output tensors.
 struct MultiTensorGroupGemmOutputArgs {
-  void *data_ptrs[kMaxTensorsPerKernel];
-  int rows[kMaxTensorsPerKernel];
-  int cols[kMaxTensorsPerKernel];
+  void *data_ptrs[kMaxGroups];
+  int rows[kMaxGroups];
+  int cols[kMaxGroups];
 };
 
 // Arguments for the grouped GEMM kernel that operates on multiple inputA tensors.
 struct MultiTensorGroupGemmInputArgs {
-  void *data_ptrs[kMaxTensorsPerKernel];
-  void *scale_inv_ptrs[kMaxTensorsPerKernel];
-  int rows[kMaxTensorsPerKernel];
-  int cols[kMaxTensorsPerKernel];
+  void *data_ptrs[kMaxGroups];
+  void *scale_inv_ptrs[kMaxGroups];
+  int rows[kMaxGroups];
+  int cols[kMaxGroups];
 };
 struct MultiTensorListInfo {
   bool all_row = true;
@@ -426,8 +426,8 @@ inline MultiTensorGroupGemmOutputArgs build_grouped_gemm_multi_out_args(
              "_tensors=", list_size);
   NVTE_CHECK(list_size == expected_num_tensors, "Grouped GEMM: ", name,
              "_list must have num_tensors (", expected_num_tensors, ") entries, got ", list_size);
-  NVTE_CHECK(list_size <= static_cast<size_t>(kMaxTensorsPerKernel), "Grouped GEMM: ", name,
-             "_list supports up to ", kMaxTensorsPerKernel, " tensors per kernel, got ", list_size);
+  NVTE_CHECK(list_size <= static_cast<size_t>(kMaxGroups), "Grouped GEMM: ", name,
+             "_list supports up to ", kMaxGroups, " tensors per kernel, got ", list_size);
 
   for (size_t i = 0; i < list_size; ++i) {
     const transformer_engine::Tensor *t =
@@ -500,8 +500,8 @@ inline MultiTensorListInfo validate_grouped_gemm_multi_inputA_list(const NVTETen
              "_tensors=", list_size);
   NVTE_CHECK(list_size == expected_num_tensors, "Grouped GEMM: ", name,
              "_list must have num_tensors (", expected_num_tensors, ") entries, got ", list_size);
-  NVTE_CHECK(list_size <= static_cast<size_t>(kMaxTensorsPerKernel), "Grouped GEMM: ", name,
-             "_list supports up to ", kMaxTensorsPerKernel, " tensors per kernel, got ", list_size);
+  NVTE_CHECK(list_size <= static_cast<size_t>(kMaxGroups), "Grouped GEMM: ", name,
+             "_list supports up to ", kMaxGroups, " tensors per kernel, got ", list_size);
 
   const transformer_engine::Tensor *t0 = transformer_engine::convertNVTETensorCheck(tensor_list[0]);
   info.scaling_mode = t0->scaling_mode;
@@ -847,9 +847,10 @@ __forceinline__ __device__ int64_t compute_grouped_tensor_offset(const TensorSha
 }
 
 // Kernel that performs (optionally scaled) bias addition to Grouped GEMM output tensors.
-// 2D grid: blockIdx.x = row chunk, blockIdx.y = column chunk.
-// Each block loads bias once for its column chunk and sweeps its rows
-// with direct vectorized load-add-store on d.
+// Fixed SM-filling grid with grid-stride over row chunks.
+// 2D grid: blockIdx.x = SM-filling row blocks, blockIdx.y = column chunk.
+// Each block grid-strides over kRowsPerBlock-sized row chunks, processing
+// all chunks that map to it. Safe when sum(first_dims) < total_rows.
 template <typename T, int kVec, bool UseScale, int kBlockDim, int kRowsPerBlock>
 __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
                                         const char *__restrict__ bias_base,
@@ -859,17 +860,12 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   using VecStorage = transformer_engine::VectorizedStorage<T, kVec>;
   using VecType = typename VecStorage::LType;
 
-  constexpr int kMaxTensors = 257;
-  __shared__ int cumsum[kMaxTensors];
-
+  __shared__ int cumsum[kMaxGroups + 1];
   const int tid = static_cast<int>(threadIdx.x);
   const int block_dim = static_cast<int>(blockDim.x);
   const int row_bid = static_cast<int>(blockIdx.x);
   const int col_bid = static_cast<int>(blockIdx.y);
-
-  const int row_start = row_bid * kRowsPerBlock;
-  const int row_end = min(row_start + kRowsPerBlock, total_rows);
-  if (row_start >= total_rows) return;
+  const int row_grid_stride = static_cast<int>(gridDim.x);
 
   const int block_cols = block_dim * kVec;
   const int col = col_bid * block_cols + tid * kVec;
@@ -887,61 +883,69 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   }
   __syncthreads();
 
-
+  const int valid_rows = cumsum[num_tensors];
 
   T *__restrict__ d = reinterpret_cast<T *>(d_base);
   const T *__restrict__ bias = reinterpret_cast<const T *>(bias_base);
 
-  // Binary search for the starting row's tensor.
-  int tensor_idx;
-  {
-    int lo = 0, hi = num_tensors;
-    while (lo < hi) {
-      int mid = (lo + hi) >> 1;
-      if (cumsum[mid + 1] <= row_start) lo = mid + 1;
-      else                              hi = mid;
-    }
-    tensor_idx = lo;
-  }
-  int bias_idx = tensor_idx * n;
+  // Grid-stride loop over row chunks.
+  for (int chunk_start = row_bid * kRowsPerBlock;
+       chunk_start < valid_rows;
+       chunk_start += row_grid_stride * kRowsPerBlock) {
+    const int row_start = chunk_start;
+    const int row_end = min(row_start + kRowsPerBlock, valid_rows);
 
-  VecStorage b_in;
-  b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
-
-  // Walk tensor segments within this block's row range.
-  int seg_start = row_start;
-  while (seg_start < row_end) {
-    while (tensor_idx < num_tensors - 1 && cumsum[tensor_idx + 1] <= seg_start) {
-      tensor_idx++;
-      bias_idx += n;
+    // Binary search for the starting row's tensor.
+    int tensor_idx;
+    {
+      int lo = 0, hi = num_tensors;
+      while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (cumsum[mid + 1] <= row_start) lo = mid + 1;
+        else                              hi = mid;
+      }
+      tensor_idx = lo;
     }
+    int bias_idx = tensor_idx * n;
+
+    VecStorage b_in;
     b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
-    const int seg_end = min(cumsum[tensor_idx + 1], row_end);
 
-    for (int row = seg_start; row < seg_end; row++) {
-      T *d_ptr = d + row * n + col;
-      VecStorage d_in;
-      d_in.scratch_.aligned = *reinterpret_cast<const VecType *>(d_ptr);
+    // Walk tensor segments within this chunk's row range.
+    int seg_start = row_start;
+    while (seg_start < row_end) {
+      while (tensor_idx < num_tensors - 1 && cumsum[tensor_idx + 1] <= seg_start) {
+        tensor_idx++;
+        bias_idx += n;
+      }
+      b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
+      const int seg_end = min(cumsum[tensor_idx + 1], row_end);
 
-      [[maybe_unused]] float s_val;
-      if constexpr (UseScale) s_val = scale_base[row];
+      for (int row = seg_start; row < seg_end; row++) {
+        T *d_ptr = d + row * n + col;
+        VecStorage d_in;
+        d_in.scratch_.aligned = *reinterpret_cast<const VecType *>(d_ptr);
+
+        [[maybe_unused]] float s_val;
+        if constexpr (UseScale) s_val = scale_base[row];
 
 #pragma unroll
-      for (int i = 0; i < kVec; ++i) {
-        if constexpr (UseScale) {
-          d_in.scratch_.separate[i] = static_cast<T>(
-              fmaf(static_cast<float>(b_in.scratch_.separate[i]), s_val,
-                   static_cast<float>(d_in.scratch_.separate[i])));
-        } else {
-          d_in.scratch_.separate[i] = static_cast<T>(
-              static_cast<float>(d_in.scratch_.separate[i]) +
-              static_cast<float>(b_in.scratch_.separate[i]));
+        for (int i = 0; i < kVec; ++i) {
+          if constexpr (UseScale) {
+            d_in.scratch_.separate[i] = static_cast<T>(
+                fmaf(static_cast<float>(b_in.scratch_.separate[i]), s_val,
+                     static_cast<float>(d_in.scratch_.separate[i])));
+          } else {
+            d_in.scratch_.separate[i] = static_cast<T>(
+                static_cast<float>(d_in.scratch_.separate[i]) +
+                static_cast<float>(b_in.scratch_.separate[i]));
+          }
         }
+        *reinterpret_cast<VecType *>(d_ptr) = d_in.scratch_.aligned;
       }
-      *reinterpret_cast<VecType *>(d_ptr) = d_in.scratch_.aligned;
-    }
 
-    seg_start = seg_end;
+      seg_start = seg_end;
+    }
   }
 }
 
@@ -1410,7 +1414,8 @@ void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTens
   constexpr int kThreads = 256;
 
   const int num_tensors = static_cast<int>(outputD->num_tensors);
-  NVTE_CHECK(num_tensors <= 256, "Grouped bias add supports at most 256 tensors, got ",
+  NVTE_CHECK(num_tensors <= kMaxGroups,
+             "Grouped bias add supports at most ", kMaxGroups, " tensors, got ",
              num_tensors);
   const int total_rows = static_cast<int>(outputD->logical_shape.data[0]);
   const int n = static_cast<int>(outputD->get_common_last_dim());
@@ -1421,14 +1426,23 @@ void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTens
   NVTE_CHECK(n % kVec == 0, "Grouped bias add requires last dim divisible by ", kVec);
 
   constexpr int kRowsPerBlock = 8;
+  constexpr int kBlocksPerSM = 8;
+
+  int device_id;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device_id));
+  int num_sms;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+
   const int block_cols = kThreads * kVec;
   const int col_blocks = (n + block_cols - 1) / block_cols;
-  const int row_blocks = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
-  const dim3 grid(row_blocks, col_blocks);
+  const int max_row_chunks = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
+  const int row_blocks = std::min(max_row_chunks, num_sms * kBlocksPerSM / col_blocks);
+  const dim3 grid(std::max(1, row_blocks), col_blocks);
   const dim3 block(kThreads);
 
   auto launch = [&](auto use_scale_tag) {
     constexpr bool kUseScale = decltype(use_scale_tag)::value;
+    // 128-bit vector loads: kVec=8 for 2-byte types (bf16/fp16), kVec=4 for fp32.
     if (elem_size <= 2) {
       constexpr int kV = 8;
       TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(dtype, T, {
