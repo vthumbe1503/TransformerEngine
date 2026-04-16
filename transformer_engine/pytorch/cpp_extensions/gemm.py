@@ -24,6 +24,7 @@ __all__ = [
     "general_gemm",
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
+    "grouped_bias_add",
 ]
 
 
@@ -416,3 +417,28 @@ def general_grouped_gemm_for_grouped_tensor(
         use_split_accumulator,
         sm_count,
     )
+
+
+def grouped_bias_add(
+    output,
+    bias,
+    bias_scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Standalone grouped scaled bias add.
+
+    Performs output[row,col] += bias[col] * scale[row] (when scale provided)
+    or output[row,col] += bias[col] (when scale is None).
+
+    Parameters
+    ----------
+    output: GroupedTensor
+        The grouped output tensor to add bias into (modified in-place).
+    bias: GroupedTensor
+        The grouped bias tensor (1 x hidden_size per group).
+    bias_scale: Optional[torch.Tensor]
+        1D float32 per-row scale tensor. If None, no scaling is applied.
+    """
+    if bias_scale is None:
+        device = output.rowwise_data.device if output.rowwise_data is not None else torch.device("cuda")
+        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    tex.te_grouped_bias_add(output, bias, bias_scale)
