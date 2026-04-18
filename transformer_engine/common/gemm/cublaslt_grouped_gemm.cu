@@ -846,19 +846,21 @@ __forceinline__ __device__ int64_t compute_grouped_tensor_offset(const TensorSha
   }
 }
 
-// Binary search on the cumsum array to find which tensor contains the given row.
-// cumsum[i] holds the exclusive end-row of tensor i.
-__forceinline__ __device__ int find_tensor_for_row(const int *cumsum, int row, int num_tensors) {
-  int lo = 0, hi = num_tensors;
-  while (lo < hi) {
-    int mid = (lo + hi) >> 1;
-    if (cumsum[mid] <= row) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
+// Linear scan to find which tensor contains the given row.
+__forceinline__ __device__ int find_tensor_for_row(
+    const int64_t *first_dims, int64_t uniform_first, int row, int num_tensors,
+    int *out_tensor_row_end) {
+  int offset = 0;
+  for (int i = 0; i < num_tensors; i++) {
+    int dim = first_dims ? static_cast<int>(first_dims[i]) : static_cast<int>(uniform_first);
+    offset += dim;
+    if (row < offset) {
+      *out_tensor_row_end = offset;
+      return i;
     }
   }
-  return lo;
+  *out_tensor_row_end = offset;
+  return num_tensors - 1;
 }
 
 // Kernel that performs (optionally scaled) bias addition to Grouped GEMM output tensors.
@@ -881,21 +883,23 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   const int col_bid = static_cast<int>(blockIdx.y);
   const int row_grid_stride = static_cast<int>(gridDim.x);
 
-  // Build cumulative-sum of first_dims in shared memory (exclusive end-row per tensor).
-  __shared__ int cumsum[kMaxGroups];
-  for (int i = tid; i < num_tensors; i += block_dim) {
-    cumsum[i] = d_meta.first_dims ? static_cast<int>(d_meta.first_dims[i])
-                                  : static_cast<int>(d_meta.uniform_first);
-  }
-  __syncthreads();
-  if (tid == 0) {
-    for (int i = 1; i < num_tensors; i++) {
-      cumsum[i] += cumsum[i - 1];
+  // Single-warp reduction to compute valid_rows = sum(first_dims).
+  // kMaxGroups <= 64 so warp 0 (32 lanes) covers it with <=2 loads each.
+  // Only cost is one __syncthreads to broadcast the result to all warps.
+  __shared__ int s_valid_rows;
+  if (tid < 32) {
+    int local_sum = 0;
+    for (int i = tid; i < num_tensors; i += 32) {
+      local_sum += d_meta.first_dims ? static_cast<int>(d_meta.first_dims[i])
+                                     : static_cast<int>(d_meta.uniform_first);
     }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (tid == 0) s_valid_rows = local_sum;
   }
   __syncthreads();
-
-  const int valid_rows = cumsum[num_tensors - 1];
+  const int valid_rows = s_valid_rows;
 
   const int block_cols = block_dim * kVec;
   const int col = col_bid * block_cols + tid * kVec;
@@ -911,9 +915,9 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
     const int row_start = chunk_start;
     const int row_end = min(row_start + kRowsPerBlock, valid_rows);
 
-    // O(log num_tensors) lookup via binary search on the cumsum array.
-    int tensor_idx = find_tensor_for_row(cumsum, row_start, num_tensors);
-    int tensor_row_end = cumsum[tensor_idx];
+    int tensor_row_end;
+    int tensor_idx = find_tensor_for_row(d_meta.first_dims, d_meta.uniform_first,
+                                         row_start, num_tensors, &tensor_row_end);
     int bias_idx = tensor_idx * n;
 
     VecStorage b_in;
@@ -925,7 +929,9 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
       while (tensor_idx < num_tensors - 1 && tensor_row_end <= seg_start) {
         tensor_idx++;
         bias_idx += n;
-        tensor_row_end = cumsum[tensor_idx];
+        int dim = d_meta.first_dims ? static_cast<int>(d_meta.first_dims[tensor_idx])
+                                    : static_cast<int>(d_meta.uniform_first);
+        tensor_row_end += dim;
       }
       b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
       const int seg_end = min(tensor_row_end, row_end);
