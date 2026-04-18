@@ -146,7 +146,7 @@ def make_grouped_output(
         data=data,
         first_dims=first_dims,
         tensor_offsets=tensor_offsets,
-    ), actual_rows
+    ), actual_rows, padded_rows
 
 
 def make_grouped_bias(
@@ -272,12 +272,12 @@ def run_ncu_profile(args):
     dtype = DTYPE_MAP[args.dtype]
     device = torch.device("cuda")
 
-    output_gt, total_rows = make_grouped_output(
+    output_gt, total_rows, padded_rows = make_grouped_output(
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
     if args.use_scale:
-        bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
+        bias_scale = torch.randn(padded_rows, dtype=torch.float32, device=device)
     else:
         bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
@@ -332,12 +332,12 @@ def run_ncu_target(args):
     dtype = DTYPE_MAP[args.dtype]
     device = torch.device("cuda")
 
-    output_gt, total_rows = make_grouped_output(
+    output_gt, total_rows, padded_rows = make_grouped_output(
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
     if args.use_scale:
-        bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
+        bias_scale = torch.randn(padded_rows, dtype=torch.float32, device=device)
     else:
         bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
@@ -810,13 +810,13 @@ def main():
     print("-" * len(header))
 
     for num_tensors, rows, hidden, use_scale, imbalance, overalloc in configs:
-        output_gt, total_rows = make_grouped_output(
+        output_gt, total_rows, padded_rows = make_grouped_output(
             num_tensors, rows, hidden, dtype, device, imbalance, overalloc
         )
         bias_gt = make_grouped_bias(num_tensors, hidden, dtype, device)
 
         if use_scale:
-            bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
+            bias_scale = torch.randn(padded_rows, dtype=torch.float32, device=device)
         else:
             bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
@@ -837,12 +837,12 @@ def main():
         )
 
         # With CUDA graph
-        output_gt_g, _ = make_grouped_output(
+        output_gt_g, _, padded_rows_g = make_grouped_output(
             num_tensors, rows, hidden, dtype, device, imbalance, overalloc
         )
         bias_gt_g = make_grouped_bias(num_tensors, hidden, dtype, device)
         if use_scale:
-            bias_scale_g = torch.randn(total_rows, dtype=torch.float32, device=device)
+            bias_scale_g = torch.randn(padded_rows_g, dtype=torch.float32, device=device)
         else:
             bias_scale_g = torch.empty(0, dtype=torch.float32, device=device)
 
