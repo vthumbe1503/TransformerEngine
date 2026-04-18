@@ -168,6 +168,8 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     at::Tensor workspace_cublas,
                                                     bool use_split_accumulator, int math_sm_count);
 
+void te_grouped_bias_add(py::handle output, py::handle bias, at::Tensor bias_scale);
+
 /***************************************************************************************************
  * Transpose
  **************************************************************************************************/

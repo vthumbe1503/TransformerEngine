@@ -425,7 +425,7 @@ foreach(cuda_source IN LISTS nvte_sources_with_fast_math)
 endforeach()
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -lineinfo")
 
 # Number of parallel build jobs
 if($ENV{MAX_JOBS})
