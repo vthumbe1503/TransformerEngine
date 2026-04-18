@@ -865,10 +865,12 @@ __forceinline__ __device__ int find_tensor_for_row(
 }
 
 // Kernel that performs (optionally scaled) bias addition to Grouped GEMM output tensors.
-// Fixed SM-filling grid with grid-stride over row chunks.
+// SM-filling grid with grid-stride over row chunks.
 // 2D grid: blockIdx.x = SM-filling row blocks, blockIdx.y = column chunk.
 // Each block grid-strides over kRowsPerBlock-sized row chunks, processing
 // all chunks that map to it. Safe when sum(first_dims) < total_rows.
+// A single-warp reduction computes valid_rows = sum(first_dims) so that
+// blocks in the overallocated region exit after a cheap check.
 template <typename T, int kVec, bool UseScale, int kBlockDim, int kRowsPerBlock>
 __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
                                         const char *__restrict__ bias_base,
@@ -879,20 +881,30 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   using VecType = typename VecStorage::LType;
 
   const int tid = static_cast<int>(threadIdx.x);
-  const int block_dim = static_cast<int>(blockDim.x);
   const int row_bid = static_cast<int>(blockIdx.x);
   const int col_bid = static_cast<int>(blockIdx.y);
   const int row_grid_stride = static_cast<int>(gridDim.x);
 
-  const int block_cols = block_dim * kVec;
+  // Single-warp reduction to compute valid_rows = sum(first_dims).
+  // kMaxGroups <= 64 so warp 0 (32 lanes) covers it with <=2 loads each.
+  __shared__ int s_valid_rows;
+  if (tid < 32) {
+    int local_sum = 0;
+    for (int i = tid; i < num_tensors; i += 32) {
+      local_sum += d_meta.first_dims ? static_cast<int>(d_meta.first_dims[i])
+                                     : static_cast<int>(d_meta.uniform_first);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (tid == 0) s_valid_rows = local_sum;
+  }
+  __syncthreads();
+  const int valid_rows = s_valid_rows;
+
+  const int block_cols = kBlockDim * kVec;
   const int col = col_bid * block_cols + tid * kVec;
   if (col >= n) return;
-
-  int valid_rows = 0;
-  for (int i = 0; i < num_tensors; i++) {
-    valid_rows += d_meta.first_dims ? static_cast<int>(d_meta.first_dims[i])
-                                    : static_cast<int>(d_meta.uniform_first);
-  }
 
   T *__restrict__ d = reinterpret_cast<T *>(d_base);
   const T *__restrict__ bias = reinterpret_cast<const T *>(bias_base);
@@ -1418,7 +1430,7 @@ void launch_grouped_bias_add(const transformer_engine::GroupedTensor *outputD,
   NVTE_CHECK(n % kVec == 0, api_name, ": requires last dim divisible by ", kVec);
 
   constexpr int kRowsPerBlock = 8;
-  constexpr int kBlocksPerSM = 4;
+  constexpr int kBlocksPerSM = 16;
 
   const int num_sms = transformer_engine::cuda::sm_count();
 
