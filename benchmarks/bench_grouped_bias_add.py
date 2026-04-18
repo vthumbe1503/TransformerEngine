@@ -9,7 +9,7 @@ Measures effective memory bandwidth (TB/s) with and without CUDA graphs,
 and compares against the GPU's theoretical peak HBM bandwidth.
 
 Usage:
-    python benchmarks/bench_grouped_bias_add.py [--use-scale] [--num-tensors N]
+    python benchmarks/bench_grouped_bias_add.py [--num-tensors N]
                                                  [--rows M] [--hidden H]
                                                  [--dtype {bf16,fp16,fp32}]
                                                  [--warmup W] [--iters I]
@@ -172,7 +172,6 @@ def compute_bandwidth_tb_s(
     hidden_size: int,
     num_tensors: int,
     dtype: torch.dtype,
-    use_scale: bool,
     elapsed_ms: float,
 ) -> float:
     """Compute effective memory bandwidth in TB/s.
@@ -181,13 +180,11 @@ def compute_bandwidth_tb_s(
       - Read output:  total_rows * hidden_size * elem_size
       - Write output: total_rows * hidden_size * elem_size
       - Read bias:    num_tensors * hidden_size * elem_size  (broadcast across rows)
-      - Read scale:   total_rows * 4 bytes  (if use_scale, fp32)
     """
     elem_size = torch.tensor([], dtype=dtype).element_size()
     output_bytes = total_rows * hidden_size * elem_size
     bias_bytes = num_tensors * hidden_size * elem_size
-    scale_bytes = total_rows * 4 if use_scale else 0
-    total_bytes = 2 * output_bytes + bias_bytes + scale_bytes
+    total_bytes = 2 * output_bytes + bias_bytes
     elapsed_s = elapsed_ms / 1000.0
     return (total_bytes / elapsed_s) / 1e12
 
@@ -199,11 +196,11 @@ def compute_bandwidth_tb_s(
 def bench_no_graph(
     output_gt: GroupedTensor,
     bias_gt: GroupedTensor,
-    bias_scale: torch.Tensor,
     warmup: int,
     iters: int,
 ) -> float:
     """Benchmark without CUDA graphs. Returns median time in ms."""
+    bias_scale = torch.empty(0, dtype=torch.float32, device=output_gt.rowwise_data.device)
     for _ in range(warmup):
         tex.te_grouped_bias_add(output_gt, bias_gt, bias_scale)
     torch.cuda.synchronize()
@@ -225,11 +222,11 @@ def bench_no_graph(
 def bench_with_graph(
     output_gt: GroupedTensor,
     bias_gt: GroupedTensor,
-    bias_scale: torch.Tensor,
     warmup: int,
     iters: int,
 ) -> float:
     """Benchmark with CUDA graph capture. Returns median time in ms."""
+    bias_scale = torch.empty(0, dtype=torch.float32, device=output_gt.rowwise_data.device)
     # Warmup before capture
     for _ in range(3):
         tex.te_grouped_bias_add(output_gt, bias_gt, bias_scale)
@@ -273,10 +270,7 @@ def run_ncu_profile(args):
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
-    if args.use_scale:
-        bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
-    else:
-        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
     # Warmup to JIT-compile and stabilise
     for _ in range(5):
@@ -292,10 +286,9 @@ def run_ncu_profile(args):
     print("Profiled kernel invocation complete.  Run this script under ncu:")
     elem_size = torch.tensor([], dtype=dtype).element_size()
     total_bytes = (2 * total_rows * args.hidden * elem_size
-                   + args.num_tensors * args.hidden * elem_size
-                   + (total_rows * 4 if args.use_scale else 0))
+                   + args.num_tensors * args.hidden * elem_size)
     print(f"  Config: {args.num_tensors} tensors, {args.rows} rows, {args.hidden} hidden, "
-          f"scale={'Y' if args.use_scale else 'N'}, imbalance={args.imbalance}")
+          f"imbalance={args.imbalance}")
     print(f"  Expected traffic: {total_bytes / 1e6:.2f} MB")
     print()
     print("Example ncu command (run from shell, not via this script):")
@@ -308,8 +301,6 @@ def run_ncu_profile(args):
         f"--num-tensors {args.num_tensors} --rows {args.rows} --hidden {args.hidden} "
         f"--dtype {args.dtype} --imbalance {args.imbalance}"
     )
-    if args.use_scale:
-        ncu_cmd += " --use-scale"
     print(f"  {ncu_cmd}")
     print()
     print("Key metrics to look at in the ncu output:")
@@ -333,10 +324,7 @@ def run_ncu_target(args):
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
-    if args.use_scale:
-        bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
-    else:
-        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
     # Warmup outside profiler range
     for _ in range(3):
@@ -367,8 +355,6 @@ def run_ncu_inline(args):
         "--dtype", args.dtype,
         "--imbalance", args.imbalance,
     ]
-    if args.use_scale:
-        target_cmd.append("--use-scale")
 
     ncu_metrics = [
         "dram__throughput.avg.pct_of_peak_sustained_elapsed",
@@ -399,8 +385,7 @@ def run_ncu_inline(args):
     ] + target_cmd
 
     print(f"Config: {args.num_tensors} tensors, {args.rows} rows, "
-          f"{args.hidden} hidden, scale={'Y' if args.use_scale else 'N'}, "
-          f"imbalance={args.imbalance}, dtype={args.dtype}")
+          f"{args.hidden} hidden, imbalance={args.imbalance}, dtype={args.dtype}")
     print(f"Running: {' '.join(ncu_cmd)}")
     print()
 
@@ -463,8 +448,7 @@ def run_ncu_inline(args):
     elem_size = torch.tensor([], dtype=DTYPE_MAP[args.dtype]).element_size()
     total_rows_val = args.num_tensors * args.rows
     expected_bytes = (2 * total_rows_val * args.hidden * elem_size
-                      + args.num_tensors * args.hidden * elem_size
-                      + (total_rows_val * 4 if args.use_scale else 0))
+                      + args.num_tensors * args.hidden * elem_size)
 
     print("=" * 80)
     print("Nsight Compute Kernel Metrics")
@@ -668,7 +652,6 @@ def run_baseline(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark grouped_bias_add_kernel")
-    parser.add_argument("--use-scale", action="store_true", help="Enable per-row scaling")
     parser.add_argument("--num-tensors", type=int, default=8, help="Number of tensors in group")
     parser.add_argument("--rows", type=int, default=4096, help="Rows per tensor (M)")
     parser.add_argument("--hidden", type=int, default=4096, help="Hidden size (N)")
@@ -708,77 +691,49 @@ def main():
 
     if args.sweep:
         configs = [
-            # (num_tensors, rows, hidden, use_scale, imbalance)
+            # (num_tensors, rows, hidden, imbalance)
             # --- Uniform baselines ---
-            (1,   4096, 4096,  False, "none"),
-            (1,   4096, 4096,  True,  "none"),
-            (1,  32768, 4096,  False, "none"),
-            (1,  32768, 4096,  True,  "none"),
-            (1,  65536, 4096,  False, "none"),
-            (1,  65536, 4096,  True,  "none"),
-            (4,   4096, 4096,  False, "none"),
-            (4,   4096, 4096,  True,  "none"),
-            (8,   4096, 4096,  False, "none"),
-            (8,   4096, 4096,  True,  "none"),
-            (8,   8192, 4096,  False, "none"),
-            (8,   8192, 4096,  True,  "none"),
-            (16,  4096, 4096,  False, "none"),
-            (16,  4096, 4096,  True,  "none"),
-            (32,  2048, 4096,  False, "none"),
-            (32,  2048, 4096,  True,  "none"),
-            (32,  4096, 4096,  False, "none"),
-            (32,  4096, 4096,  True,  "none"),
-            (8,   4096, 12288, False, "none"),
-            (8,   4096, 12288, True,  "none"),
-            (64,  1024, 4096,  False, "none"),
-            (64,  1024, 4096,  True,  "none"),
-            (64,  2048, 4096,  False, "none"),
-            (64,  2048, 4096,  True,  "none"),
-            (64,  4096, 4096,  False, "none"),
-            (64,  4096, 4096,  True,  "none"),
+            (1,   4096, 4096,  "none"),
+            (1,  32768, 4096,  "none"),
+            (1,  65536, 4096,  "none"),
+            (4,   4096, 4096,  "none"),
+            (8,   4096, 4096,  "none"),
+            (8,   8192, 4096,  "none"),
+            (16,  4096, 4096,  "none"),
+            (32,  2048, 4096,  "none"),
+            (32,  4096, 4096,  "none"),
+            (8,   4096, 12288, "none"),
+            (64,  1024, 4096,  "none"),
+            (64,  2048, 4096,  "none"),
+            (64,  4096, 4096,  "none"),
             # --- Real workload shape ---
-            (16,  6144, 2880,  False, "none"),
-            (16,  6144, 2880,  True,  "none"),
-            (64,  6144, 2880,  False, "none"),
-            (64,  6144, 2880,  True,  "none"),
+            (16,  6144, 2880,  "none"),
+            (64,  6144, 2880,  "none"),
             # --- Mild MoE-like imbalance ---
-            (8,   4096, 4096,  False, "mild"),
-            (8,   4096, 4096,  True,  "mild"),
-            (16,  4096, 4096,  False, "mild"),
-            (16,  4096, 4096,  True,  "mild"),
-            (32,  4096, 4096,  False, "mild"),
-            (32,  4096, 4096,  True,  "mild"),
-            (64,  1024, 4096,  False, "mild"),
-            (64,  1024, 4096,  True,  "mild"),
-            (64,  4096, 4096,  False, "mild"),
-            (64,  4096, 4096,  True,  "mild"),
+            (8,   4096, 4096,  "mild"),
+            (16,  4096, 4096,  "mild"),
+            (32,  4096, 4096,  "mild"),
+            (64,  1024, 4096,  "mild"),
+            (64,  4096, 4096,  "mild"),
             # --- Heavy hotspot imbalance ---
-            (8,   4096, 4096,  False, "heavy"),
-            (8,   4096, 4096,  True,  "heavy"),
-            (16,  4096, 4096,  False, "heavy"),
-            (16,  4096, 4096,  True,  "heavy"),
-            (32,  4096, 4096,  False, "heavy"),
-            (32,  4096, 4096,  True,  "heavy"),
-            (64,  4096, 4096,  False, "heavy"),
-            (64,  4096, 4096,  True,  "heavy"),
+            (8,   4096, 4096,  "heavy"),
+            (16,  4096, 4096,  "heavy"),
+            (32,  4096, 4096,  "heavy"),
+            (64,  4096, 4096,  "heavy"),
             # --- Zipf distribution ---
-            (8,   4096, 4096,  False, "zipf"),
-            (8,   4096, 4096,  True,  "zipf"),
-            (16,  4096, 4096,  False, "zipf"),
-            (16,  4096, 4096,  True,  "zipf"),
-            (32,  4096, 4096,  False, "zipf"),
-            (32,  4096, 4096,  True,  "zipf"),
-            (64,  4096, 4096,  False, "zipf"),
-            (64,  4096, 4096,  True,  "zipf"),
+            (8,   4096, 4096,  "zipf"),
+            (16,  4096, 4096,  "zipf"),
+            (32,  4096, 4096,  "zipf"),
+            (64,  4096, 4096,  "zipf"),
         ]
     else:
         configs = [
-            (args.num_tensors, args.rows, args.hidden, args.use_scale, args.imbalance),
+            (args.num_tensors, args.rows, args.hidden, args.imbalance),
         ]
 
     dtype = DTYPE_MAP[args.dtype]
     header = (
-        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'scale':>5} {'imbal':>5} "
+        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'imbal':>5} "
         f"{'min_r':>6} {'max_r':>6} {'ratio':>5} {'total_MB':>9} "
         f"{'no_graph_ms':>11} {'no_graph_TB/s':>13} {'no_graph_%':>9} "
         f"{'graph_ms':>9} {'graph_TB/s':>11} {'graph_%':>7}"
@@ -786,16 +741,11 @@ def main():
     print(header)
     print("-" * len(header))
 
-    for num_tensors, rows, hidden, use_scale, imbalance in configs:
+    for num_tensors, rows, hidden, imbalance in configs:
         output_gt, total_rows = make_grouped_output(
             num_tensors, rows, hidden, dtype, device, imbalance
         )
         bias_gt = make_grouped_bias(num_tensors, hidden, dtype, device)
-
-        if use_scale:
-            bias_scale = torch.randn(total_rows, dtype=torch.float32, device=device)
-        else:
-            bias_scale = torch.empty(0, dtype=torch.float32, device=device)
 
         # Compute per-expert row stats for display
         row_list = _generate_imbalanced_rows(num_tensors, rows, imbalance)
@@ -804,13 +754,12 @@ def main():
 
         elem_size = torch.tensor([], dtype=dtype).element_size()
         total_mb = (total_rows * hidden * elem_size * 2
-                    + num_tensors * hidden * elem_size
-                    + (total_rows * 4 if use_scale else 0)) / 1e6
+                    + num_tensors * hidden * elem_size) / 1e6
 
         # Without CUDA graph
-        t_no_graph = bench_no_graph(output_gt, bias_gt, bias_scale, args.warmup, args.iters)
+        t_no_graph = bench_no_graph(output_gt, bias_gt, args.warmup, args.iters)
         bw_no_graph = compute_bandwidth_tb_s(
-            total_rows, hidden, num_tensors, dtype, use_scale, t_no_graph
+            total_rows, hidden, num_tensors, dtype, t_no_graph
         )
 
         # With CUDA graph
@@ -818,14 +767,10 @@ def main():
             num_tensors, rows, hidden, dtype, device, imbalance
         )
         bias_gt_g = make_grouped_bias(num_tensors, hidden, dtype, device)
-        if use_scale:
-            bias_scale_g = torch.randn(total_rows, dtype=torch.float32, device=device)
-        else:
-            bias_scale_g = torch.empty(0, dtype=torch.float32, device=device)
 
-        t_graph = bench_with_graph(output_gt_g, bias_gt_g, bias_scale_g, args.warmup, args.iters)
+        t_graph = bench_with_graph(output_gt_g, bias_gt_g, args.warmup, args.iters)
         bw_graph = compute_bandwidth_tb_s(
-            total_rows, hidden, num_tensors, dtype, use_scale, t_graph
+            total_rows, hidden, num_tensors, dtype, t_graph
         )
 
         pct_no_graph = 100.0 * bw_no_graph / peak_bw
@@ -833,7 +778,6 @@ def main():
 
         print(
             f"{num_tensors:>5} {rows:>6} {hidden:>6} "
-            f"{'Y' if use_scale else 'N':>5} "
             f"{imbalance:>5} "
             f"{min_r:>6} {max_r:>6} {ratio:>5.1f} "
             f"{total_mb:>9.2f} "
@@ -845,7 +789,7 @@ def main():
     print(f"Peak HBM bandwidth: {peak_bw:.2f} TB/s")
     print(f"dtype: {args.dtype} ({torch.tensor([], dtype=dtype).element_size()} bytes)")
     print(
-        "Note: Effective BW = (2*output_bytes + bias_bytes + scale_bytes) / elapsed_time\n"
+        "Note: Effective BW = (2*output_bytes + bias_bytes) / elapsed_time\n"
         "      'graph' column uses CUDA graph replay to eliminate CPU overhead."
     )
 

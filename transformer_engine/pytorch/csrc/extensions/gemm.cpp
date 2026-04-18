@@ -797,18 +797,10 @@ void te_grouped_bias_add(py::handle output, py::handle bias, at::Tensor bias_sca
   auto grouped_output = GroupedTensorFromPyTorchGroupedTensor(output);
   auto grouped_bias = GroupedTensorFromPyTorchGroupedTensor(bias);
 
-  if (bias_scale.numel() > 0) {
-    auto te_bias_scale = makeTransformerEngineTensor(bias_scale);
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_grouped_scaled_bias_add(grouped_output.data(), grouped_bias.data(), te_bias_scale.data(),
-                                   at::cuda::getCurrentCUDAStream());
-    });
-  } else {
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_grouped_bias_add(grouped_output.data(), grouped_bias.data(),
-                            at::cuda::getCurrentCUDAStream());
-    });
-  }
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_grouped_bias_add(grouped_output.data(), grouped_bias.data(),
+                          at::cuda::getCurrentCUDAStream());
+  });
 }
 
 }  // namespace transformer_engine::pytorch

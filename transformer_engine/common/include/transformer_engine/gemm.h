@@ -431,6 +431,7 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
 
 /*! \brief Grouped bias add for grouped GEMM outputs.
 *
+* output[row,col] += bias[col].
 * Requires uniform last-dimension across all output tensors and bias tensors.
 */
 void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
