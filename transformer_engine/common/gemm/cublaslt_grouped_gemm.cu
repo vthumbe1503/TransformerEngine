@@ -864,10 +864,10 @@ __forceinline__ __device__ int find_tensor_for_row(
 }
 
 // Kernel that performs (optionally scaled) bias addition to Grouped GEMM output tensors.
-// Fixed SM-filling grid with grid-stride over row chunks.
-// 2D grid: blockIdx.x = SM-filling row blocks, blockIdx.y = column chunk.
-// Each block grid-strides over kRowsPerBlock-sized row chunks, processing
-// all chunks that map to it. Safe when sum(first_dims) < total_rows.
+// 2D grid: blockIdx.x = row chunk index, blockIdx.y = column chunk.
+// Each block handles exactly one kRowsPerBlock-sized row chunk.
+// A single-warp reduction computes valid_rows = sum(first_dims) so that
+// blocks in the overallocated region exit after a cheap check.
 template <typename T, int kVec, bool UseScale, int kBlockDim, int kRowsPerBlock>
 __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
                                         const char *__restrict__ bias_base,
@@ -878,14 +878,11 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   using VecType = typename VecStorage::LType;
 
   const int tid = static_cast<int>(threadIdx.x);
-  const int block_dim = static_cast<int>(blockDim.x);
   const int row_bid = static_cast<int>(blockIdx.x);
   const int col_bid = static_cast<int>(blockIdx.y);
-  const int row_grid_stride = static_cast<int>(gridDim.x);
 
   // Single-warp reduction to compute valid_rows = sum(first_dims).
   // kMaxGroups <= 64 so warp 0 (32 lanes) covers it with <=2 loads each.
-  // Only cost is one __syncthreads to broadcast the result to all warps.
   __shared__ int s_valid_rows;
   if (tid < 32) {
     int local_sum = 0;
@@ -901,66 +898,62 @@ __global__ void grouped_bias_add_kernel(char *__restrict__ d_base,
   __syncthreads();
   const int valid_rows = s_valid_rows;
 
-  const int block_cols = block_dim * kVec;
+  const int row_start = row_bid * kRowsPerBlock;
+  if (row_start >= valid_rows) return;
+  const int row_end = min(row_start + kRowsPerBlock, valid_rows);
+
+  const int block_cols = kBlockDim * kVec;
   const int col = col_bid * block_cols + tid * kVec;
   if (col >= n) return;
 
   T *__restrict__ d = reinterpret_cast<T *>(d_base);
   const T *__restrict__ bias = reinterpret_cast<const T *>(bias_base);
 
-  // Grid-stride loop over row chunks.
-  for (int chunk_start = row_bid * kRowsPerBlock;
-       chunk_start < valid_rows;
-       chunk_start += row_grid_stride * kRowsPerBlock) {
-    const int row_start = chunk_start;
-    const int row_end = min(row_start + kRowsPerBlock, valid_rows);
+  int tensor_row_end;
+  int tensor_idx = find_tensor_for_row(d_meta.first_dims, d_meta.uniform_first,
+                                       row_start, num_tensors, &tensor_row_end);
+  int bias_idx = tensor_idx * n;
 
-    int tensor_row_end;
-    int tensor_idx = find_tensor_for_row(d_meta.first_dims, d_meta.uniform_first,
-                                         row_start, num_tensors, &tensor_row_end);
-    int bias_idx = tensor_idx * n;
+  VecStorage b_in;
+  b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
 
-    VecStorage b_in;
+  // Walk tensor segments within this block's row range.
+  int seg_start = row_start;
+  while (seg_start < row_end) {
+    while (tensor_idx < num_tensors - 1 && tensor_row_end <= seg_start) {
+      tensor_idx++;
+      bias_idx += n;
+      int dim = d_meta.first_dims ? static_cast<int>(d_meta.first_dims[tensor_idx])
+                                  : static_cast<int>(d_meta.uniform_first);
+      tensor_row_end += dim;
+    }
     b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
+    const int seg_end = min(tensor_row_end, row_end);
 
-    // Walk tensor segments within this chunk's row range.
-    int seg_start = row_start;
-    while (seg_start < row_end) {
-      while (tensor_idx < num_tensors - 1 && tensor_row_end <= seg_start) {
-        tensor_idx++;
-        bias_idx += n;
-        int dim = d_meta.first_dims ? static_cast<int>(d_meta.first_dims[tensor_idx])
-                                    : static_cast<int>(d_meta.uniform_first);
-        tensor_row_end += dim;
-      }
-      b_in.scratch_.aligned = *reinterpret_cast<const VecType *>(bias + bias_idx + col);
-      const int seg_end = min(tensor_row_end, row_end);
+    for (int row = seg_start; row < seg_end; row++) {
+      T *d_ptr = d + row * n + col;
+      VecStorage d_in;
+      d_in.scratch_.aligned = *reinterpret_cast<const VecType *>(d_ptr);
 
-      for (int row = seg_start; row < seg_end; row++) {
-        T *d_ptr = d + row * n + col;
-        VecStorage d_in;
-        d_in.scratch_.aligned = *reinterpret_cast<const VecType *>(d_ptr);
-
-        [[maybe_unused]] float s_val;
-        if constexpr (UseScale) s_val = scale_base[row];
+      [[maybe_unused]] float s_val;
+      if constexpr (UseScale) s_val = scale_base[row];
 
 #pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-          if constexpr (UseScale) {
-            d_in.scratch_.separate[i] = static_cast<T>(
-                fmaf(static_cast<float>(b_in.scratch_.separate[i]), s_val,
-                     static_cast<float>(d_in.scratch_.separate[i])));
-          } else {
-            d_in.scratch_.separate[i] = static_cast<T>(
-                static_cast<float>(d_in.scratch_.separate[i]) +
-                static_cast<float>(b_in.scratch_.separate[i]));
-          }
+      for (int i = 0; i < kVec; ++i) {
+        if constexpr (UseScale) {
+          d_in.scratch_.separate[i] = static_cast<T>(
+              fmaf(static_cast<float>(b_in.scratch_.separate[i]), s_val,
+                   static_cast<float>(d_in.scratch_.separate[i])));
+        } else {
+          d_in.scratch_.separate[i] = static_cast<T>(
+              static_cast<float>(d_in.scratch_.separate[i]) +
+              static_cast<float>(b_in.scratch_.separate[i]));
         }
-        *reinterpret_cast<VecType *>(d_ptr) = d_in.scratch_.aligned;
       }
-
-      seg_start = seg_end;
+      *reinterpret_cast<VecType *>(d_ptr) = d_in.scratch_.aligned;
     }
+
+    seg_start = seg_end;
   }
 }
 
