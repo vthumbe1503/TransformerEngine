@@ -2915,11 +2915,19 @@ def test_grouped_gemm_grouped_tensor(z, m, n, k, case, layout, accumulate) -> No
         else None
     )
     # Bias add in grouped kernel accumulates in FP32 for BF16/FP16.
-    out_ref = (
-        [(o.float() + b.float()).to(dtype) for o, b in zip(out_ref_no_bias, bias)]
-        if bias is not None
-        else out_ref_no_bias
-    )
+    if bias is not None:
+        if bias_scale is not None:
+            offset = 0
+            out_ref = []
+            for i in range(z):
+                ms = m_sizes[i]
+                s = bias_scale[offset : offset + ms].unsqueeze(-1)
+                out_ref.append((out_ref_no_bias[i].float() + bias[i].float() * s).to(dtype))
+                offset += ms
+        else:
+            out_ref = [(o.float() + b.float()).to(dtype) for o, b in zip(out_ref_no_bias, bias)]
+    else:
+        out_ref = out_ref_no_bias
     # Create grouped tensors based on case
     device = A[0].device
     grouped_A = A

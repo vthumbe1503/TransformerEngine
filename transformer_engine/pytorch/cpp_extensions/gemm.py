@@ -24,6 +24,7 @@ __all__ = [
     "general_gemm",
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
+    "grouped_bias_add",
 ]
 
 
@@ -327,6 +328,7 @@ def general_grouped_gemm_for_grouped_tensor(
     accumulate: bool = False,
     use_split_accumulator: bool = False,
     bias=None,
+    bias_scale: Optional[torch.Tensor] = None,
     grad: bool = False,
     alpha: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
@@ -365,6 +367,9 @@ def general_grouped_gemm_for_grouped_tensor(
             "Apply bias manually after the GEMM."
         )
 
+    if bias_scale is not None and bias is None:
+        raise ValueError("bias_scale requires bias to be provided.")
+
     num_tensors = B.num_tensors
     rowwise = B.rowwise_data
     device = rowwise.device if rowwise is not None else B.columnwise_data.device
@@ -394,6 +399,9 @@ def general_grouped_gemm_for_grouped_tensor(
     sm_count = get_sm_count()
     sm_count = sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))
 
+    if bias_scale is None:
+        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+
     return grouped_gemm_impl(
         A,
         transa,
@@ -401,6 +409,7 @@ def general_grouped_gemm_for_grouped_tensor(
         transb,
         out,
         bias,
+        bias_scale,
         alpha,
         beta,
         workspace_setup,
@@ -408,3 +417,28 @@ def general_grouped_gemm_for_grouped_tensor(
         use_split_accumulator,
         sm_count,
     )
+
+
+def grouped_bias_add(
+    output,
+    bias,
+    bias_scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Standalone grouped scaled bias add.
+
+    Performs output[row,col] += bias[col] * scale[row] (when scale provided)
+    or output[row,col] += bias[col] (when scale is None).
+
+    Parameters
+    ----------
+    output: GroupedTensor
+        The grouped output tensor to add bias into (modified in-place).
+    bias: GroupedTensor
+        The grouped bias tensor (1 x hidden_size per group).
+    bias_scale: Optional[torch.Tensor]
+        1D float32 per-row scale tensor. If None, no scaling is applied.
+    """
+    if bias_scale is None:
+        device = output.rowwise_data.device if output.rowwise_data is not None else torch.device("cuda")
+        bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    tex.te_grouped_bias_add(output, bias, bias_scale)
