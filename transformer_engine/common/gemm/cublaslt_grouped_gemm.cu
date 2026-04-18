@@ -1418,14 +1418,10 @@ void launch_grouped_bias_add(const transformer_engine::GroupedTensor *outputD,
   NVTE_CHECK(n % kVec == 0, api_name, ": requires last dim divisible by ", kVec);
 
   constexpr int kRowsPerBlock = 8;
-  constexpr int kBlocksPerSM = 4;
-
-  const int num_sms = transformer_engine::cuda::sm_count();
 
   const int block_cols = kThreads * kVec;
   const int col_blocks = (n + block_cols - 1) / block_cols;
-  const int max_row_chunks = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
-  const int row_blocks = std::min(max_row_chunks, num_sms * kBlocksPerSM / col_blocks);
+  const int row_blocks = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
   const dim3 grid(std::max(1, row_blocks), col_blocks);
   const dim3 block(kThreads);
 

@@ -113,27 +113,30 @@ def make_grouped_output(
     dtype: torch.dtype,
     device: torch.device,
     imbalance: str = "none",
+    overalloc: int = 1,
 ) -> GroupedTensor:
-    """Create a GroupedTensor for the output (num_tensors x rows x hidden_size)."""
+    """Create a GroupedTensor for the output (num_tensors x rows x hidden_size).
+
+    When overalloc > 1, the logical_shape and data buffer are inflated by that
+    factor while first_dims stays at the actual (smaller) row counts.  This
+    simulates the real-world case where sum(first_dims) < total_rows in the
+    logical shape (e.g. a pre-allocated buffer that is only partially filled).
+    """
     row_list = _generate_imbalanced_rows(num_tensors, rows_per_tensor, imbalance)
-    total_rows = sum(row_list)
+    actual_rows = sum(row_list)
+    padded_rows = actual_rows * overalloc
 
-    if imbalance != "none":
-        first_dims = torch.tensor(row_list, dtype=torch.int64, device=device)
-    else:
-        first_dims = None
+    first_dims = torch.tensor(row_list, dtype=torch.int64, device=device)
 
-    total_elements = total_rows * hidden_size
+    total_elements = padded_rows * hidden_size
     data = torch.randn(total_elements, dtype=dtype, device=device)
-    logical_shape = (total_rows, hidden_size)
+    logical_shape = (padded_rows, hidden_size)
     shapes = [(r, hidden_size) for r in row_list]
 
-    tensor_offsets = None
-    if first_dims is not None:
-        tensor_offsets = torch.cat([
-            torch.zeros(1, dtype=torch.int64, device=device),
-            torch.cumsum(first_dims * hidden_size, dim=0),
-        ])
+    tensor_offsets = torch.cat([
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.cumsum(first_dims * hidden_size, dim=0),
+    ])
 
     return GroupedTensor(
         shape=logical_shape,
@@ -143,7 +146,7 @@ def make_grouped_output(
         data=data,
         first_dims=first_dims,
         tensor_offsets=tensor_offsets,
-    ), total_rows
+    ), actual_rows
 
 
 def make_grouped_bias(
@@ -708,77 +711,97 @@ def main():
 
     if args.sweep:
         configs = [
-            # (num_tensors, rows, hidden, use_scale, imbalance)
+            # (num_tensors, rows, hidden, use_scale, imbalance, overalloc)
             # --- Uniform baselines ---
-            (1,   4096, 4096,  False, "none"),
-            (1,   4096, 4096,  True,  "none"),
-            (1,  32768, 4096,  False, "none"),
-            (1,  32768, 4096,  True,  "none"),
-            (1,  65536, 4096,  False, "none"),
-            (1,  65536, 4096,  True,  "none"),
-            (4,   4096, 4096,  False, "none"),
-            (4,   4096, 4096,  True,  "none"),
-            (8,   4096, 4096,  False, "none"),
-            (8,   4096, 4096,  True,  "none"),
-            (8,   8192, 4096,  False, "none"),
-            (8,   8192, 4096,  True,  "none"),
-            (16,  4096, 4096,  False, "none"),
-            (16,  4096, 4096,  True,  "none"),
-            (32,  2048, 4096,  False, "none"),
-            (32,  2048, 4096,  True,  "none"),
-            (32,  4096, 4096,  False, "none"),
-            (32,  4096, 4096,  True,  "none"),
-            (8,   4096, 12288, False, "none"),
-            (8,   4096, 12288, True,  "none"),
-            (64,  1024, 4096,  False, "none"),
-            (64,  1024, 4096,  True,  "none"),
-            (64,  2048, 4096,  False, "none"),
-            (64,  2048, 4096,  True,  "none"),
-            (64,  4096, 4096,  False, "none"),
-            (64,  4096, 4096,  True,  "none"),
+            (1,   4096, 4096,  False, "none", 1),
+            (1,   4096, 4096,  True,  "none", 1),
+            (1,  32768, 4096,  False, "none", 1),
+            (1,  32768, 4096,  True,  "none", 1),
+            (1,  65536, 4096,  False, "none", 1),
+            (1,  65536, 4096,  True,  "none", 1),
+            (4,   4096, 4096,  False, "none", 1),
+            (4,   4096, 4096,  True,  "none", 1),
+            (8,   4096, 4096,  False, "none", 1),
+            (8,   4096, 4096,  True,  "none", 1),
+            (8,   8192, 4096,  False, "none", 1),
+            (8,   8192, 4096,  True,  "none", 1),
+            (16,  4096, 4096,  False, "none", 1),
+            (16,  4096, 4096,  True,  "none", 1),
+            (32,  2048, 4096,  False, "none", 1),
+            (32,  2048, 4096,  True,  "none", 1),
+            (32,  4096, 4096,  False, "none", 1),
+            (32,  4096, 4096,  True,  "none", 1),
+            (8,   4096, 12288, False, "none", 1),
+            (8,   4096, 12288, True,  "none", 1),
+            (64,  1024, 4096,  False, "none", 1),
+            (64,  1024, 4096,  True,  "none", 1),
+            (64,  2048, 4096,  False, "none", 1),
+            (64,  2048, 4096,  True,  "none", 1),
+            (64,  4096, 4096,  False, "none", 1),
+            (64,  4096, 4096,  True,  "none", 1),
             # --- Real workload shape ---
-            (16,  6144, 2880,  False, "none"),
-            (16,  6144, 2880,  True,  "none"),
-            (64,  6144, 2880,  False, "none"),
-            (64,  6144, 2880,  True,  "none"),
+            (16,  6144, 2880,  False, "none", 1),
+            (16,  6144, 2880,  True,  "none", 1),
+            (64,  6144, 2880,  False, "none", 1),
+            (64,  6144, 2880,  True,  "none", 1),
             # --- Mild MoE-like imbalance ---
-            (8,   4096, 4096,  False, "mild"),
-            (8,   4096, 4096,  True,  "mild"),
-            (16,  4096, 4096,  False, "mild"),
-            (16,  4096, 4096,  True,  "mild"),
-            (32,  4096, 4096,  False, "mild"),
-            (32,  4096, 4096,  True,  "mild"),
-            (64,  1024, 4096,  False, "mild"),
-            (64,  1024, 4096,  True,  "mild"),
-            (64,  4096, 4096,  False, "mild"),
-            (64,  4096, 4096,  True,  "mild"),
+            (8,   4096, 4096,  False, "mild",  1),
+            (8,   4096, 4096,  True,  "mild",  1),
+            (16,  4096, 4096,  False, "mild",  1),
+            (16,  4096, 4096,  True,  "mild",  1),
+            (32,  4096, 4096,  False, "mild",  1),
+            (32,  4096, 4096,  True,  "mild",  1),
+            (64,  1024, 4096,  False, "mild",  1),
+            (64,  1024, 4096,  True,  "mild",  1),
+            (64,  4096, 4096,  False, "mild",  1),
+            (64,  4096, 4096,  True,  "mild",  1),
             # --- Heavy hotspot imbalance ---
-            (8,   4096, 4096,  False, "heavy"),
-            (8,   4096, 4096,  True,  "heavy"),
-            (16,  4096, 4096,  False, "heavy"),
-            (16,  4096, 4096,  True,  "heavy"),
-            (32,  4096, 4096,  False, "heavy"),
-            (32,  4096, 4096,  True,  "heavy"),
-            (64,  4096, 4096,  False, "heavy"),
-            (64,  4096, 4096,  True,  "heavy"),
+            (8,   4096, 4096,  False, "heavy", 1),
+            (8,   4096, 4096,  True,  "heavy", 1),
+            (16,  4096, 4096,  False, "heavy", 1),
+            (16,  4096, 4096,  True,  "heavy", 1),
+            (32,  4096, 4096,  False, "heavy", 1),
+            (32,  4096, 4096,  True,  "heavy", 1),
+            (64,  4096, 4096,  False, "heavy", 1),
+            (64,  4096, 4096,  True,  "heavy", 1),
             # --- Zipf distribution ---
-            (8,   4096, 4096,  False, "zipf"),
-            (8,   4096, 4096,  True,  "zipf"),
-            (16,  4096, 4096,  False, "zipf"),
-            (16,  4096, 4096,  True,  "zipf"),
-            (32,  4096, 4096,  False, "zipf"),
-            (32,  4096, 4096,  True,  "zipf"),
-            (64,  4096, 4096,  False, "zipf"),
-            (64,  4096, 4096,  True,  "zipf"),
+            (8,   4096, 4096,  False, "zipf",  1),
+            (8,   4096, 4096,  True,  "zipf",  1),
+            (16,  4096, 4096,  False, "zipf",  1),
+            (16,  4096, 4096,  True,  "zipf",  1),
+            (32,  4096, 4096,  False, "zipf",  1),
+            (32,  4096, 4096,  True,  "zipf",  1),
+            (64,  4096, 4096,  False, "zipf",  1),
+            (64,  4096, 4096,  True,  "zipf",  1),
+            # --- Overallocated buffer: sum(first_dims) < total_rows ---
+            # overalloc=N means logical_shape rows = N * actual rows
+            (8,   4096, 4096,  False, "none", 2),
+            (8,   4096, 4096,  False, "none", 4),
+            (8,   4096, 4096,  False, "none", 8),
+            (8,   4096, 4096,  True,  "none", 2),
+            (8,   4096, 4096,  True,  "none", 4),
+            (8,   4096, 4096,  True,  "none", 8),
+            (16,  4096, 4096,  False, "none", 2),
+            (16,  4096, 4096,  False, "none", 4),
+            (16,  4096, 4096,  False, "none", 8),
+            (16,  4096, 4096,  True,  "none", 2),
+            (16,  4096, 4096,  True,  "none", 4),
+            (16,  4096, 4096,  True,  "none", 8),
+            (64,  1024, 4096,  False, "none", 2),
+            (64,  1024, 4096,  False, "none", 4),
+            (64,  1024, 4096,  False, "none", 8),
+            (64,  1024, 4096,  True,  "none", 2),
+            (64,  1024, 4096,  True,  "none", 4),
+            (64,  1024, 4096,  True,  "none", 8),
         ]
     else:
         configs = [
-            (args.num_tensors, args.rows, args.hidden, args.use_scale, args.imbalance),
+            (args.num_tensors, args.rows, args.hidden, args.use_scale, args.imbalance, 1),
         ]
 
     dtype = DTYPE_MAP[args.dtype]
     header = (
-        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'scale':>5} {'imbal':>5} "
+        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'scale':>5} {'imbal':>5} {'oalloc':>6} "
         f"{'min_r':>6} {'max_r':>6} {'ratio':>5} {'total_MB':>9} "
         f"{'no_graph_ms':>11} {'no_graph_TB/s':>13} {'no_graph_%':>9} "
         f"{'graph_ms':>9} {'graph_TB/s':>11} {'graph_%':>7}"
@@ -786,9 +809,9 @@ def main():
     print(header)
     print("-" * len(header))
 
-    for num_tensors, rows, hidden, use_scale, imbalance in configs:
+    for num_tensors, rows, hidden, use_scale, imbalance, overalloc in configs:
         output_gt, total_rows = make_grouped_output(
-            num_tensors, rows, hidden, dtype, device, imbalance
+            num_tensors, rows, hidden, dtype, device, imbalance, overalloc
         )
         bias_gt = make_grouped_bias(num_tensors, hidden, dtype, device)
 
@@ -815,7 +838,7 @@ def main():
 
         # With CUDA graph
         output_gt_g, _ = make_grouped_output(
-            num_tensors, rows, hidden, dtype, device, imbalance
+            num_tensors, rows, hidden, dtype, device, imbalance, overalloc
         )
         bias_gt_g = make_grouped_bias(num_tensors, hidden, dtype, device)
         if use_scale:
@@ -834,7 +857,7 @@ def main():
         print(
             f"{num_tensors:>5} {rows:>6} {hidden:>6} "
             f"{'Y' if use_scale else 'N':>5} "
-            f"{imbalance:>5} "
+            f"{imbalance:>5} {overalloc:>6} "
             f"{min_r:>6} {max_r:>6} {ratio:>5.1f} "
             f"{total_mb:>9.2f} "
             f"{t_no_graph:>11.4f} {bw_no_graph:>13.3f} {pct_no_graph:>8.1f}% "
