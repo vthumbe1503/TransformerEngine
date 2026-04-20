@@ -8,6 +8,11 @@
 Measures effective memory bandwidth (TB/s) with and without CUDA graphs,
 and compares against the GPU's theoretical peak HBM bandwidth.
 
+Note: the per-row scale (`use_scale=True`) variant is not implemented on this
+branch (the C++ binding accepts a `bias_scale` argument but the underlying
+kernel ignores it).  All scale configurations are therefore skipped and only
+the unscaled bias-add is benchmarked here.
+
 Usage:
     python benchmarks/bench_grouped_bias_add.py [--num-tensors N]
                                                  [--rows M] [--hidden H]
@@ -113,27 +118,30 @@ def make_grouped_output(
     dtype: torch.dtype,
     device: torch.device,
     imbalance: str = "none",
+    overalloc: int = 1,
 ) -> GroupedTensor:
-    """Create a GroupedTensor for the output (num_tensors x rows x hidden_size)."""
+    """Create a GroupedTensor for the output (num_tensors x rows x hidden_size).
+
+    When overalloc > 1, the logical_shape and data buffer are inflated by that
+    factor while first_dims stays at the actual (smaller) row counts.  This
+    simulates the real-world case where sum(first_dims) < total_rows in the
+    logical shape (e.g. a pre-allocated buffer that is only partially filled).
+    """
     row_list = _generate_imbalanced_rows(num_tensors, rows_per_tensor, imbalance)
-    total_rows = sum(row_list)
+    actual_rows = sum(row_list)
+    padded_rows = actual_rows * overalloc
 
-    if imbalance != "none":
-        first_dims = torch.tensor(row_list, dtype=torch.int64, device=device)
-    else:
-        first_dims = None
+    first_dims = torch.tensor(row_list, dtype=torch.int64, device=device)
 
-    total_elements = total_rows * hidden_size
+    total_elements = padded_rows * hidden_size
     data = torch.randn(total_elements, dtype=dtype, device=device)
-    logical_shape = (total_rows, hidden_size)
+    logical_shape = (padded_rows, hidden_size)
     shapes = [(r, hidden_size) for r in row_list]
 
-    tensor_offsets = None
-    if first_dims is not None:
-        tensor_offsets = torch.cat([
-            torch.zeros(1, dtype=torch.int64, device=device),
-            torch.cumsum(first_dims * hidden_size, dim=0),
-        ])
+    tensor_offsets = torch.cat([
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.cumsum(first_dims * hidden_size, dim=0),
+    ])
 
     return GroupedTensor(
         shape=logical_shape,
@@ -143,7 +151,7 @@ def make_grouped_output(
         data=data,
         first_dims=first_dims,
         tensor_offsets=tensor_offsets,
-    ), total_rows
+    ), actual_rows, padded_rows
 
 
 def make_grouped_bias(
@@ -189,6 +197,31 @@ def compute_bandwidth_tb_s(
     return (total_bytes / elapsed_s) / 1e12
 
 
+def _empty_bias_scale(device: torch.device) -> torch.Tensor:
+    """Return a 0-element float32 tensor used to satisfy the C++ binding signature.
+
+    The current branch's `te_grouped_bias_add` keeps the `bias_scale` parameter
+    in its signature but ignores it.  We pass an empty tensor so the call is
+    well-formed without enabling any (non-existent) scaling path.
+    """
+    return torch.empty(0, dtype=torch.float32, device=device)
+
+
+# CUDA / HIP gridDim.y is capped at 65535 on every shipping GPU.  The current
+# `grouped_bias_add_kernel` launches `dim3(num_tensors, blocks_per_tensor)` with
+# `blocks_per_tensor = ceil(padded_rows * hidden / (kVec * kThreads))` and
+# kVec=4, kThreads=256 (so 1024 elements per block).  Any config whose
+# `padded_rows * hidden` exceeds `_MAX_GRID_Y * 1024 = 67,107,840` elements
+# will fail the kernel launch with "invalid argument".
+_MAX_GRID_Y = 65535
+_ELEMS_PER_BLOCK = 4 * 256  # kVec * kThreads
+_MAX_LOGICAL_ELEMS = _MAX_GRID_Y * _ELEMS_PER_BLOCK  # ~67M
+
+
+def _exceeds_grid_limit(padded_rows: int, hidden: int) -> bool:
+    return padded_rows * hidden > _MAX_LOGICAL_ELEMS
+
+
 # ---------------------------------------------------------------------------
 # Benchmark routines
 # ---------------------------------------------------------------------------
@@ -196,11 +229,12 @@ def compute_bandwidth_tb_s(
 def bench_no_graph(
     output_gt: GroupedTensor,
     bias_gt: GroupedTensor,
+    bias_scale: torch.Tensor,
     warmup: int,
     iters: int,
 ) -> float:
+    # bias_scale is a 0-element placeholder; the kernel on this branch ignores it.
     """Benchmark without CUDA graphs. Returns median time in ms."""
-    bias_scale = torch.empty(0, dtype=torch.float32, device=output_gt.rowwise_data.device)
     for _ in range(warmup):
         tex.te_grouped_bias_add(output_gt, bias_gt, bias_scale)
     torch.cuda.synchronize()
@@ -222,11 +256,12 @@ def bench_no_graph(
 def bench_with_graph(
     output_gt: GroupedTensor,
     bias_gt: GroupedTensor,
+    bias_scale: torch.Tensor,
     warmup: int,
     iters: int,
 ) -> float:
     """Benchmark with CUDA graph capture. Returns median time in ms."""
-    bias_scale = torch.empty(0, dtype=torch.float32, device=output_gt.rowwise_data.device)
+    # bias_scale is a 0-element placeholder; the kernel on this branch ignores it.
     # Warmup before capture
     for _ in range(3):
         tex.te_grouped_bias_add(output_gt, bias_gt, bias_scale)
@@ -266,11 +301,11 @@ def run_ncu_profile(args):
     dtype = DTYPE_MAP[args.dtype]
     device = torch.device("cuda")
 
-    output_gt, total_rows = make_grouped_output(
+    output_gt, total_rows, padded_rows = make_grouped_output(
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
-    bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    bias_scale = _empty_bias_scale(device)
 
     # Warmup to JIT-compile and stabilise
     for _ in range(5):
@@ -320,11 +355,11 @@ def run_ncu_target(args):
     dtype = DTYPE_MAP[args.dtype]
     device = torch.device("cuda")
 
-    output_gt, total_rows = make_grouped_output(
+    output_gt, total_rows, padded_rows = make_grouped_output(
         args.num_tensors, args.rows, args.hidden, dtype, device, args.imbalance
     )
     bias_gt = make_grouped_bias(args.num_tensors, args.hidden, dtype, device)
-    bias_scale = torch.empty(0, dtype=torch.float32, device=device)
+    bias_scale = _empty_bias_scale(device)
 
     # Warmup outside profiler range
     for _ in range(3):
@@ -690,50 +725,71 @@ def main():
     print(f"{'='*90}")
 
     if args.sweep:
+        # NOTE: every config below must satisfy `padded_rows * hidden <= ~67M`
+        # (see _exceeds_grid_limit).  Configs that violate the cap are skipped
+        # at runtime with a warning so the rest of the sweep still completes.
         configs = [
-            # (num_tensors, rows, hidden, imbalance)
-            # --- Uniform baselines ---
-            (1,   4096, 4096,  "none"),
-            (1,  32768, 4096,  "none"),
-            (1,  65536, 4096,  "none"),
-            (4,   4096, 4096,  "none"),
-            (8,   4096, 4096,  "none"),
-            (8,   8192, 4096,  "none"),
-            (16,  4096, 4096,  "none"),
-            (32,  2048, 4096,  "none"),
-            (32,  4096, 4096,  "none"),
-            (8,   4096, 12288, "none"),
-            (64,  1024, 4096,  "none"),
-            (64,  2048, 4096,  "none"),
-            (64,  4096, 4096,  "none"),
-            # --- Real workload shape ---
-            (16,  6144, 2880,  "none"),
-            (64,  6144, 2880,  "none"),
+            # (num_tensors, rows, hidden, imbalance, overalloc)
+            # NOTE: dropped all configs that hit padded_rows*hidden = 67,108,864
+            # (= 65536 blocks/tensor) since they overflow the gridDim.y cap of
+            # 65535 by exactly one block.  The largest safe config here is
+            # padded_rows*hidden ≈ 50.3M elements (49152 blocks).
+            # --- Tiny / small (kernel launch overhead regime) ---
+            (1,    128, 4096,  "none", 1),   # 0.5M elems
+            (1,    512, 4096,  "none", 1),   # 2.0M
+            (1,   1024, 4096,  "none", 1),   # 4.2M
+            (1,   2048, 4096,  "none", 1),   # 8.4M
+            (1,   4096, 4096,  "none", 1),   # 16.8M
+            (1,   8192, 4096,  "none", 1),   # 33.5M
+            # --- Multi-tensor uniform baselines ---
+            (2,   4096, 4096,  "none", 1),   # 33.5M
+            (4,   2048, 4096,  "none", 1),   # 33.5M
+            (8,   1024, 4096,  "none", 1),   # 33.5M
+            (16,   512, 4096,  "none", 1),   # 33.5M
+            (32,   256, 4096,  "none", 1),   # 33.5M
+            (64,   128, 4096,  "none", 1),   # 33.5M
+            # --- Larger hidden ---
+            (1,   4096, 12288, "none", 1),   # 50.3M
+            (2,   2048, 12288, "none", 1),   # 50.3M
+            (4,   1024, 12288, "none", 1),   # 50.3M
+            (8,    512, 12288, "none", 1),   # 50.3M
+            # --- Real workload shape (hidden=2880) ---
+            (1,   8192, 2880,  "none", 1),   # 23.6M
+            (4,   2048, 2880,  "none", 1),   # 23.6M
+            (8,   1024, 2880,  "none", 1),   # 23.6M
+            (16,  1024, 2880,  "none", 1),   # 47.2M
+            (8,   2048, 2880,  "none", 1),   # 47.2M
             # --- Mild MoE-like imbalance ---
-            (8,   4096, 4096,  "mild"),
-            (16,  4096, 4096,  "mild"),
-            (32,  4096, 4096,  "mild"),
-            (64,  1024, 4096,  "mild"),
-            (64,  4096, 4096,  "mild"),
+            (8,   1024, 4096,  "mild",  1),
+            (16,   512, 4096,  "mild",  1),
+            (32,   256, 4096,  "mild",  1),
+            (64,   128, 4096,  "mild",  1),
             # --- Heavy hotspot imbalance ---
-            (8,   4096, 4096,  "heavy"),
-            (16,  4096, 4096,  "heavy"),
-            (32,  4096, 4096,  "heavy"),
-            (64,  4096, 4096,  "heavy"),
+            (8,   1024, 4096,  "heavy", 1),
+            (16,   512, 4096,  "heavy", 1),
+            (32,   256, 4096,  "heavy", 1),
+            (64,   128, 4096,  "heavy", 1),
             # --- Zipf distribution ---
-            (8,   4096, 4096,  "zipf"),
-            (16,  4096, 4096,  "zipf"),
-            (32,  4096, 4096,  "zipf"),
-            (64,  4096, 4096,  "zipf"),
+            (8,   1024, 4096,  "zipf",  1),
+            (16,   512, 4096,  "zipf",  1),
+            (32,   256, 4096,  "zipf",  1),
+            (64,   128, 4096,  "zipf",  1),
+            # --- Overallocated buffer: sum(first_dims) < total_rows ---
+            # overalloc=N means logical_shape rows = N * actual rows
+            (4,   1024, 4096,  "none", 2),   # 33.5M
+            (8,    512, 4096,  "none", 2),   # 33.5M
+            (16,   256, 4096,  "none", 2),   # 33.5M
+            (8,    256, 4096,  "none", 4),   # 33.5M
+            (16,   128, 4096,  "none", 4),   # 33.5M
         ]
     else:
         configs = [
-            (args.num_tensors, args.rows, args.hidden, args.imbalance),
+            (args.num_tensors, args.rows, args.hidden, args.imbalance, 1),
         ]
 
     dtype = DTYPE_MAP[args.dtype]
     header = (
-        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'imbal':>5} "
+        f"{'ntens':>5} {'rows':>6} {'hidden':>6} {'imbal':>5} {'oalloc':>6} "
         f"{'min_r':>6} {'max_r':>6} {'ratio':>5} {'total_MB':>9} "
         f"{'no_graph_ms':>11} {'no_graph_TB/s':>13} {'no_graph_%':>9} "
         f"{'graph_ms':>9} {'graph_TB/s':>11} {'graph_%':>7}"
@@ -741,14 +797,31 @@ def main():
     print(header)
     print("-" * len(header))
 
-    for num_tensors, rows, hidden, imbalance in configs:
-        output_gt, total_rows = make_grouped_output(
-            num_tensors, rows, hidden, dtype, device, imbalance
+    skipped = []
+    for num_tensors, rows, hidden, imbalance, overalloc in configs:
+        # Pre-flight check: skip configs whose padded_rows*hidden would exceed
+        # gridDim.y on the GPU (kernel launches with `dim3(num_tensors, blocks)`
+        # and CUDA/HIP cap blocks at 65535).
+        row_list = _generate_imbalanced_rows(num_tensors, rows, imbalance)
+        actual_rows = sum(row_list)
+        padded_rows_pred = actual_rows * overalloc
+        if _exceeds_grid_limit(padded_rows_pred, hidden):
+            blocks = (padded_rows_pred * hidden + _ELEMS_PER_BLOCK - 1) // _ELEMS_PER_BLOCK
+            print(
+                f"{num_tensors:>5} {rows:>6} {hidden:>6} "
+                f"{imbalance:>5} {overalloc:>6} "
+                f"  -- SKIPPED: would launch {blocks} blocks/tensor "
+                f"(> gridDim.y limit of {_MAX_GRID_Y})"
+            )
+            skipped.append((num_tensors, rows, hidden, imbalance, overalloc, blocks))
+            continue
+
+        output_gt, total_rows, padded_rows = make_grouped_output(
+            num_tensors, rows, hidden, dtype, device, imbalance, overalloc
         )
         bias_gt = make_grouped_bias(num_tensors, hidden, dtype, device)
+        bias_scale = _empty_bias_scale(device)
 
-        # Compute per-expert row stats for display
-        row_list = _generate_imbalanced_rows(num_tensors, rows, imbalance)
         min_r, max_r = min(row_list), max(row_list)
         ratio = max_r / max(min_r, 1)
 
@@ -756,44 +829,59 @@ def main():
         total_mb = (total_rows * hidden * elem_size * 2
                     + num_tensors * hidden * elem_size) / 1e6
 
-        # Without CUDA graph
-        t_no_graph = bench_no_graph(output_gt, bias_gt, args.warmup, args.iters)
-        bw_no_graph = compute_bandwidth_tb_s(
-            total_rows, hidden, num_tensors, dtype, t_no_graph
-        )
+        try:
+            t_no_graph = bench_no_graph(output_gt, bias_gt, bias_scale, args.warmup, args.iters)
+            bw_no_graph = compute_bandwidth_tb_s(
+                total_rows, hidden, num_tensors, dtype, t_no_graph
+            )
 
-        # With CUDA graph
-        output_gt_g, _ = make_grouped_output(
-            num_tensors, rows, hidden, dtype, device, imbalance
-        )
-        bias_gt_g = make_grouped_bias(num_tensors, hidden, dtype, device)
+            output_gt_g, _, _ = make_grouped_output(
+                num_tensors, rows, hidden, dtype, device, imbalance, overalloc
+            )
+            bias_gt_g = make_grouped_bias(num_tensors, hidden, dtype, device)
+            bias_scale_g = _empty_bias_scale(device)
 
-        t_graph = bench_with_graph(output_gt_g, bias_gt_g, args.warmup, args.iters)
-        bw_graph = compute_bandwidth_tb_s(
-            total_rows, hidden, num_tensors, dtype, t_graph
-        )
+            t_graph = bench_with_graph(output_gt_g, bias_gt_g, bias_scale_g, args.warmup, args.iters)
+            bw_graph = compute_bandwidth_tb_s(
+                total_rows, hidden, num_tensors, dtype, t_graph
+            )
+        except RuntimeError as e:
+            print(
+                f"{num_tensors:>5} {rows:>6} {hidden:>6} "
+                f"{imbalance:>5} {overalloc:>6} "
+                f"  -- FAILED: {str(e).splitlines()[0]}"
+            )
+            skipped.append((num_tensors, rows, hidden, imbalance, overalloc, -1))
+            continue
 
         pct_no_graph = 100.0 * bw_no_graph / peak_bw
         pct_graph = 100.0 * bw_graph / peak_bw
 
         print(
             f"{num_tensors:>5} {rows:>6} {hidden:>6} "
-            f"{imbalance:>5} "
+            f"{imbalance:>5} {overalloc:>6} "
             f"{min_r:>6} {max_r:>6} {ratio:>5.1f} "
             f"{total_mb:>9.2f} "
             f"{t_no_graph:>11.4f} {bw_no_graph:>13.3f} {pct_no_graph:>8.1f}% "
             f"{t_graph:>9.4f} {bw_graph:>11.3f} {pct_graph:>6.1f}%"
         )
 
+    if skipped:
+        print()
+        print(f"Skipped {len(skipped)} config(s) due to kernel grid-dim limits "
+              f"(padded_rows * hidden > {_MAX_LOGICAL_ELEMS:,} elements).")
+
     print(f"\n{'='*90}")
     print(f"Peak HBM bandwidth: {peak_bw:.2f} TB/s")
     print(f"dtype: {args.dtype} ({torch.tensor([], dtype=dtype).element_size()} bytes)")
     print(
         "Note: Effective BW = (2*output_bytes + bias_bytes) / elapsed_time\n"
-        "      'graph' column uses CUDA graph replay to eliminate CPU overhead."
+        "      'graph' column uses CUDA graph replay to eliminate CPU overhead.\n"
+        "      Per-row scaling is not supported on this branch and is not benchmarked.\n"
+        f"      Kernel limit: padded_rows * hidden <= {_MAX_LOGICAL_ELEMS:,} elements\n"
+        f"      (gridDim.y cap = {_MAX_GRID_Y}, {_ELEMS_PER_BLOCK} elems/block)."
     )
 
 
 if __name__ == "__main__":
     main()
-
