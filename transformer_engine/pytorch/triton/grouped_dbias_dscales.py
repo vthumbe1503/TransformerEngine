@@ -10,7 +10,10 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from transformer_engine.common.triton.grouped_dbias_dscales import _grouped_dbias_kernel
+from transformer_engine.common.triton.grouped_dbias_dscales import (
+    _grouped_dbias_kernel,
+    _grouped_dbias_rowwise_kernel,
+)
 
 
 def _is_deterministic_mode() -> bool:
@@ -40,24 +43,59 @@ def _launch_grouped_dbias(
             "Disable determinism or use a deterministic fallback."
         )
 
-    BLOCK_M = 128
-    BLOCK_H = 128
+    BLOCK_M = int(os.getenv("NVTE_GROUPED_DBIAS_BLOCK_M", "128"))
     N_ROW_SPLITS = 4
+    BLOCKS_PER_SM = int(os.getenv("NVTE_GROUPED_DBIAS_BLOCKS_PER_SM", "32"))
+    KERNEL = os.getenv("NVTE_GROUPED_DBIAS_KERNEL", "rowwise")
     has_scales = scales is not None
+    hidden = dy.shape[1]
+    block_h_override = int(os.getenv("NVTE_GROUPED_DBIAS_BLOCK_H", "0"))
+    if block_h_override > 0:
+        BLOCK_H = block_h_override
+    else:
+        BLOCK_H = 128
     assert (
         has_scales == (bias is not None) == (dscales is not None)
     ), "_launch_grouped_dbias: scales, bias and dscales must be provided together"
 
-    hidden = dy.shape[1]
     num_groups = dbias.shape[0]
+    num_sms = torch.cuda.get_device_properties(dy.device).multi_processor_count
 
     # Triton requires real pointers; reuse dy as a harmless dummy when unused.
     scales_arg = scales if has_scales else dy
     bias_arg = bias if has_scales else dy
     dscales_arg = dscales if has_scales else dy
 
-    grid = (num_groups, N_ROW_SPLITS, triton.cdiv(hidden, BLOCK_H))
-    _grouped_dbias_kernel[grid](
+    if KERNEL == "old":
+        col_blocks = triton.cdiv(hidden, BLOCK_H)
+        grid = (num_groups, N_ROW_SPLITS, col_blocks)
+        _grouped_dbias_kernel[grid](
+            dy,
+            dbias,
+            offsets,
+            scales_arg,
+            bias_arg,
+            dscales_arg,
+            hidden,
+            HAS_SCALES=has_scales,
+            N_ROW_SPLITS=N_ROW_SPLITS,
+            BLOCK_M=BLOCK_M,
+            BLOCK_H=BLOCK_H,
+            num_warps=4,
+            num_stages=2,
+        )
+        return
+    if KERNEL != "rowwise":
+        raise ValueError(f"Unknown grouped dbias Triton kernel: {KERNEL}")
+
+    col_blocks = triton.cdiv(hidden, BLOCK_H)
+    max_row_workers = triton.cdiv(dy.shape[0], BLOCK_M)
+    row_workers = min(
+        max_row_workers,
+        max(1, num_sms * BLOCKS_PER_SM // col_blocks),
+    )
+    grid = (max(1, row_workers), col_blocks)
+    _grouped_dbias_rowwise_kernel[grid](
         dy,
         dbias,
         offsets,
@@ -65,11 +103,11 @@ def _launch_grouped_dbias(
         bias_arg,
         dscales_arg,
         hidden,
+        num_groups,
         HAS_SCALES=has_scales,
-        N_ROW_SPLITS=N_ROW_SPLITS,
         BLOCK_M=BLOCK_M,
         BLOCK_H=BLOCK_H,
-        num_warps=4,
+        num_warps=1,
         num_stages=2,
     )
 
