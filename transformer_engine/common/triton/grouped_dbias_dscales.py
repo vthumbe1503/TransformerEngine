@@ -118,47 +118,75 @@ def _grouped_dbias_rowwise_kernel(
 
     Grid: (row_workers, cdiv(hidden, BLOCK_H)).
 
-    Each program owns a row chunk and one column tile. This keeps the row
-    scheduling independent of ``num_groups`` while preserving column
-    parallelism.
+    Each program owns one *contiguous* slab of rows and one column tile.
+    The slab size is ``ceil(total_rows / row_workers)`` rounded up to a
+    multiple of ``BLOCK_M`` so that ``chunk_start = pid * chunk_size`` is
+    always aligned to a tile boundary. Workers whose slab starts past
+    ``total_rows`` exit early.
+
+    Within its slab, a CTA walks rows in ``BLOCK_M`` tiles and keeps a
+    single ``dbias_acc`` for the current group. The accumulator is flushed
+    with one fp32 atomic-add only when the CTA crosses a group boundary
+    (and once more at the end). Likewise, when ``HAS_SCALES`` is true the
+    per-group ``bias`` row is loaded only on a group transition. This
+    minimises both the number of bias loads and the number of ``dbias``
+    atomics per CTA -- O(groups touched by this CTA) instead of
+    O(chunks * groups-per-chunk) under the previous interleaved
+    grid-stride scheme. Same idea as the contiguous CUDA
+    ``grouped_bias_add`` forward kernel.
     """
     row_worker = tl.program_id(0)
     col_block = tl.program_id(1)
-    row_worker_stride = tl.num_programs(0)
+    num_row_workers = tl.num_programs(0)
 
     total_rows = tl.load(offsets_ptr + num_groups)
-    chunk_start = (row_worker * BLOCK_M).to(tl.int64)
+
+    # Contiguous slab per CTA, aligned to BLOCK_M so subsequent tiles are
+    # aligned with respect to the slab start.
+    chunk_size = (total_rows + num_row_workers - 1) // num_row_workers
+    chunk_size = ((chunk_size + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+    chunk_start = (row_worker * chunk_size).to(tl.int64)
+
+    if chunk_start >= total_rows:
+        return
+
+    chunk_end = tl.minimum(chunk_start + chunk_size, total_rows)
 
     row_offs = tl.arange(0, BLOCK_M)
     col_offs = col_block * BLOCK_H + tl.arange(0, BLOCK_H)
     col_mask = col_offs < hidden
 
-    while chunk_start < total_rows:
-        chunk_end = tl.minimum(chunk_start + BLOCK_M, total_rows)
+    # Locate the starting group: smallest g with offsets[g+1] > chunk_start.
+    group_idx = 0
+    group_end = tl.load(offsets_ptr + 1)
+    while (group_idx + 1 < num_groups) & (group_end <= chunk_start):
+        group_idx += 1
+        group_end = tl.load(offsets_ptr + group_idx + 1)
 
-        group_idx = 0
-        group_end = tl.load(offsets_ptr + 1)
-        while (group_idx + 1 < num_groups) & (group_end <= chunk_start):
-            group_idx += 1
-            group_end = tl.load(offsets_ptr + group_idx + 1)
+    if HAS_SCALES:
+        bias_vals = tl.load(
+            bias_ptr + group_idx * hidden + col_offs,
+            mask=col_mask,
+            other=0.0,
+        ).to(tl.float32)
 
-        seg_start = chunk_start
-        while seg_start < chunk_end:
+    dbias_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    seg_start = chunk_start
+    while seg_start < chunk_end:
+        # Crossed into the next group(s): flush the previous accumulator
+        # with a single atomic-add and pick up a fresh bias row.
+        if group_end <= seg_start:
+            tl.atomic_add(
+                dbias_ptr + group_idx * hidden + col_offs,
+                dbias_acc,
+                mask=col_mask,
+                sem="relaxed",
+            )
+            dbias_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
             while (group_idx + 1 < num_groups) & (group_end <= seg_start):
                 group_idx += 1
                 group_end = tl.load(offsets_ptr + group_idx + 1)
-
-            seg_end = tl.minimum(group_end, chunk_end)
-            if HAS_SCALES:
-                dscales_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-            global_rows = seg_start + row_offs
-            row_mask = global_rows < seg_end
-            if HAS_SCALES:
-                scales_vals = tl.load(scales_ptr + global_rows, mask=row_mask, other=0.0).to(
-                    tl.float32
-                )
-
             if HAS_SCALES:
                 bias_vals = tl.load(
                     bias_ptr + group_idx * hidden + col_offs,
@@ -166,30 +194,46 @@ def _grouped_dbias_rowwise_kernel(
                     other=0.0,
                 ).to(tl.float32)
 
-            tile_mask = row_mask[:, None] & col_mask[None, :]
-            dy_tile = tl.load(
-                dy_ptr + global_rows[:, None] * hidden + col_offs[None, :],
-                mask=tile_mask,
-                other=0.0,
-            ).to(tl.float32)
+        # Tile is at most BLOCK_M rows and never crosses a group boundary
+        # nor the slab boundary, so a single bias is valid for the whole tile.
+        seg_end = tl.minimum(tl.minimum(group_end, chunk_end), seg_start + BLOCK_M)
 
-            if HAS_SCALES:
-                dbias_acc = tl.sum(dy_tile * scales_vals[:, None], axis=0)
-                dscales_acc += tl.sum(dy_tile * bias_vals[None, :], axis=1)
-            else:
-                dbias_acc = tl.sum(dy_tile, axis=0)
+        global_rows = seg_start + row_offs
+        row_mask = global_rows < seg_end
 
-            tl.atomic_add(
-                dbias_ptr + group_idx * hidden + col_offs,
-                dbias_acc,
-                mask=col_mask,
+        tile_mask = row_mask[:, None] & col_mask[None, :]
+        dy_tile = tl.load(
+            dy_ptr + global_rows[:, None] * hidden + col_offs[None, :],
+            mask=tile_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        if HAS_SCALES:
+            scales_vals = tl.load(scales_ptr + global_rows, mask=row_mask, other=0.0).to(
+                tl.float32
             )
+            dbias_acc += tl.sum(dy_tile * scales_vals[:, None], axis=0)
+            dscales_partial = tl.sum(dy_tile * bias_vals[None, :], axis=1)
+            # ``sem='relaxed'``: we never read the returned old value, so the
+            # default acq_rel fence is pure overhead -- the relaxed atomic
+            # lets the L2 reorder them and roughly halves the per-issue stall.
+            tl.atomic_add(
+                dscales_ptr + global_rows,
+                dscales_partial,
+                mask=row_mask,
+                sem="relaxed",
+            )
+        else:
+            dbias_acc += tl.sum(dy_tile, axis=0)
 
-            if HAS_SCALES:
-                tl.atomic_add(dscales_ptr + global_rows, dscales_acc, mask=row_mask)
+        seg_start = seg_end
 
-            seg_start = seg_end
-
-        chunk_start += (row_worker_stride * BLOCK_M).to(tl.int64)
+    # Final flush for the last group touched by this CTA.
+    tl.atomic_add(
+        dbias_ptr + group_idx * hidden + col_offs,
+        dbias_acc,
+        mask=col_mask,
+        sem="relaxed",
+    )
 
 
