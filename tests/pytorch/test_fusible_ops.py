@@ -2230,6 +2230,203 @@ class TestBasicOps:
                 else:
                     assert b_test.grad is None
 
+    @pytest.mark.parametrize("single_grouped_weight", (False, True))
+    @pytest.mark.parametrize("single_grouped_bias", (False, True))
+    @pytest.mark.parametrize("bias", (False, True))
+    def test_grouped_linear_meta_init(
+        self,
+        *,
+        group_size: int = 4,
+        in_features: int = 64,
+        out_features: int = 32,
+        bias: bool,
+        single_grouped_weight: bool,
+        single_grouped_bias: bool,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        """Meta-device init for GroupedLinear, including ``single_grouped_*``.
+
+        Verifies that:
+        * Constructing the op on ``device='meta'`` does not allocate any
+          CUDA memory and exposes the expected parameter layout (``weight``
+          / ``bias`` as ``GroupedTensor`` parameters when ``single_grouped_*``
+          is enabled, ``weight{i}`` / ``bias{i}`` otherwise).
+        * Calling ``reset_parameters()`` materializes parameters on CUDA
+          with matching layout/shapes.
+        * A forward + backward pass through the materialized op produces
+          values that match a plain PyTorch reference.
+        """
+
+        if single_grouped_bias and not bias:
+            pytest.skip("single_grouped_bias requires bias=True")
+
+        # Construct on meta and verify no CUDA allocation
+        torch.cuda.synchronize()
+        cuda_mem_before = torch.cuda.memory_allocated(device=0)
+        op = te_ops.GroupedLinear(
+            group_size,
+            in_features,
+            out_features,
+            bias=bias,
+            device="meta",
+            dtype=dtype,
+            single_grouped_weight=single_grouped_weight,
+            single_grouped_bias=single_grouped_bias,
+        )
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated(device=0) == cuda_mem_before, (
+            "Constructing GroupedLinear with device='meta' prematurely allocated "
+            "memory on CUDA device"
+        )
+
+        # Verify expected parameter layout on meta
+        op_weight = op._parameters.get("weight", None)
+        op_bias = op._parameters.get("bias", None)
+        if single_grouped_weight:
+            assert isinstance(op_weight, torch.nn.Parameter)
+            assert isinstance(op_weight, GroupedTensor)
+            assert op_weight.device.type == "meta"
+            assert tuple(op_weight.shape) == (group_size, out_features, in_features)
+            for i in range(group_size):
+                assert getattr(op, f"weight{i}") is None
+        else:
+            assert op_weight is None
+            for i in range(group_size):
+                w = getattr(op, f"weight{i}")
+                assert isinstance(w, torch.nn.Parameter)
+                assert w.device.type == "meta"
+                assert tuple(w.shape) == (out_features, in_features)
+
+        if bias:
+            if single_grouped_bias:
+                assert isinstance(op_bias, torch.nn.Parameter)
+                assert isinstance(op_bias, GroupedTensor)
+                assert op_bias.device.type == "meta"
+                assert tuple(op_bias.shape) == (group_size, out_features)
+                for i in range(group_size):
+                    assert getattr(op, f"bias{i}") is None
+            else:
+                assert op_bias is None
+                for i in range(group_size):
+                    b = getattr(op, f"bias{i}")
+                    assert isinstance(b, torch.nn.Parameter)
+                    assert b.device.type == "meta"
+                    assert tuple(b.shape) == (out_features,)
+        else:
+            assert op_bias is None
+            for i in range(group_size):
+                assert getattr(op, f"bias{i}") is None
+
+        # Materialize on CUDA via reset_parameters
+        with torch.no_grad():
+            op.reset_parameters()
+        if single_grouped_weight:
+            assert op.weight.device.type == "cuda"
+            assert isinstance(op.weight, GroupedTensor)
+            assert tuple(op.weight.shape) == (group_size, out_features, in_features)
+        else:
+            for i in range(group_size):
+                w = getattr(op, f"weight{i}")
+                assert w.device.type == "cuda"
+                assert tuple(w.shape) == (out_features, in_features)
+        if bias and single_grouped_bias:
+            assert op.bias.device.type == "cuda"
+            assert isinstance(op.bias, GroupedTensor)
+            assert tuple(op.bias.shape) == (group_size, out_features)
+        elif bias:
+            for i in range(group_size):
+                b = getattr(op, f"bias{i}")
+                assert b.device.type == "cuda"
+                assert tuple(b.shape) == (out_features,)
+
+        # Forward + backward sanity check against a plain PyTorch reference.
+        # Use controlled weight/bias values (rather than the kaiming-random
+        # ones produced by ``reset_parameters``) so that the comparison is
+        # robust against TF32 / float-precision noise.
+        split_alignment = 16
+        split_sizes_list = [split_alignment * (i + 1) for i in range(group_size)]
+        random.shuffle(split_sizes_list)
+        split_sizes = torch.tensor(split_sizes_list, dtype=torch.int, device="cuda")
+        in_shape = (int(split_sizes.sum().item()), in_features)
+        out_shape = (in_shape[0], out_features)
+
+        x_ref, x_test = make_reference_and_test_tensors(
+            in_shape,
+            test_dtype=dtype,
+            test_device="cuda",
+            requires_grad=True,
+        )
+        dy_ref, dy_test = make_reference_and_test_tensors(
+            out_shape,
+            test_dtype=dtype,
+            test_device="cuda",
+            requires_grad=False,
+        )
+
+        ws_ref: list[torch.Tensor] = []
+        ws_test_per_group: list[torch.Tensor] = []
+        bs_ref: list[Optional[torch.Tensor]] = []
+        bs_test_per_group: list[Optional[torch.Tensor]] = []
+        for i in range(group_size):
+            w_ref, w_test = make_reference_and_test_tensors(
+                (out_features, in_features),
+                test_dtype=dtype,
+                test_device="cuda",
+                requires_grad=True,
+            )
+            ws_ref.append(w_ref)
+            ws_test_per_group.append(w_test)
+            if bias:
+                b_ref, b_test = make_reference_and_test_tensors(
+                    (out_features,),
+                    test_dtype=dtype,
+                    test_device="cuda",
+                    requires_grad=True,
+                )
+                bs_ref.append(b_ref)
+                bs_test_per_group.append(b_test)
+            else:
+                bs_ref.append(None)
+                bs_test_per_group.append(None)
+
+        # Copy the controlled values into the materialized op parameters
+        with torch.no_grad():
+            if single_grouped_weight:
+                weight_parts = op.weight.split_into_quantized_tensors()
+                for i in range(group_size):
+                    weight_parts[i].copy_(ws_test_per_group[i])
+            else:
+                for i in range(group_size):
+                    getattr(op, f"weight{i}").copy_(ws_test_per_group[i])
+            if bias:
+                if single_grouped_bias:
+                    bias_parts = op.bias.split_into_quantized_tensors()
+                    for i in range(group_size):
+                        bias_parts[i].reshape(-1).copy_(bs_test_per_group[i])
+                else:
+                    for i in range(group_size):
+                        getattr(op, f"bias{i}").copy_(bs_test_per_group[i])
+
+        # Plain PyTorch reference
+        xs_ref = torch.split(x_ref, split_sizes_list)
+        ys_ref = []
+        for x, w, b in zip(xs_ref, ws_ref, bs_ref):
+            ys_ref.append(torch.nn.functional.linear(x, w, bias=b))
+        y_ref = torch.cat(ys_ref)
+        y_ref.backward(dy_ref)
+
+        # Run the GroupedLinear op and compare results
+        y_test = op(x_test, split_sizes)
+        y_test.backward(dy_test)
+
+        tols = dtype_tols(torch.float16) if dtype == torch.float32 else dtype_tols(dtype)
+        torch.testing.assert_close(
+            y_test.to(dtype=torch.float64, device="cpu"), y_ref, **tols
+        )
+        torch.testing.assert_close(
+            x_test.grad.to(dtype=torch.float64, device="cpu"), x_ref.grad, **tols
+        )
+
     @pytest.mark.parametrize("in_shape", ((71, 192), (5, 7, 128)))
     @pytest.mark.parametrize("input_requires_grad", (False, True))
     @pytest.mark.parametrize("scales_requires_grad", (False, True))

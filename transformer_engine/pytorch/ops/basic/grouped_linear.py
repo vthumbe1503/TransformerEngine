@@ -148,37 +148,43 @@ class GroupedLinear(BasicOperation):
         self._rng_state_tracker_function: Optional[Callable[[], CudaRNGStatesTracker]]
         self._rng_state_tracker_function = rng_state_tracker_function
 
-        # Register weights
-        # TODO(ksivaman): Proper support for meta device.
-        # We do not want to reset params later as it wipes off
-        # main_grad and related attributes.
+        # Register weight parameters with the final layout.
         self.weight0: torch.nn.Parameter
-        for group_idx in range(self.num_groups):
-            weight_tensor = torch.empty(
-                self.out_features,
-                self.in_features,
-                device=device,
-                dtype=dtype,
-            )
-            self.register_parameter(
-                f"weight{group_idx}",
-                torch.nn.Parameter(weight_tensor),
-            )
-
-        # Register biases
-        self.bias0: Optional[torch.nn.Parameter]
-        for group_idx in range(self.num_groups):
-            bias_tensor = None
-            if bias:
-                bias_tensor = torch.empty(
+        if self.single_grouped_weight:
+            self._register_single_grouped_weight(device=device, dtype=dtype)
+            for group_idx in range(self.num_groups):
+                self.register_parameter(f"weight{group_idx}", None)
+        else:
+            for group_idx in range(self.num_groups):
+                weight_tensor = torch.empty(
                     self.out_features,
+                    self.in_features,
                     device=device,
                     dtype=dtype,
                 )
-                bias_tensor = torch.nn.Parameter(bias_tensor)
-            self.register_parameter(f"bias{group_idx}", bias_tensor)
+                self.register_parameter(
+                    f"weight{group_idx}",
+                    torch.nn.Parameter(weight_tensor),
+                )
 
-        # Initialize weights if needed
+        # Register bias parameters with the final layout (no value init).
+        self.bias0: Optional[torch.nn.Parameter]
+        if self.use_bias and self.single_grouped_bias:
+            self._register_single_grouped_bias(device=device, dtype=dtype)
+            for group_idx in range(self.num_groups):
+                self.register_parameter(f"bias{group_idx}", None)
+        else:
+            for group_idx in range(self.num_groups):
+                bias_tensor = None
+                if bias:
+                    bias_tensor = torch.empty(
+                        self.out_features,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    bias_tensor = torch.nn.Parameter(bias_tensor)
+                self.register_parameter(f"bias{group_idx}", bias_tensor)
+
         if device.type != "meta":
             self.reset_parameters()
 
@@ -279,21 +285,47 @@ class GroupedLinear(BasicOperation):
         return self.use_bias
 
     def reset_parameters(self) -> None:
-        """Initialize parameter buffers and values"""
+        """Initialize parameter values in-place where possible.
 
-        # Parameter device
-        device = self.weight0.device
+        For ``single_grouped_weight``/``single_grouped_bias``, the registered
+        ``weight``/``bias`` ``GroupedTensor`` parameters are kept; their
+        underlying storage is materialized on a real device if it lived on
+        meta, and values are written in-place into per-group views. This
+        avoids changing the registered-parameter set across meta-device
+        materialization (a hard requirement for Megatron-FSDP and similar
+        frameworks that snapshot the param layout up front).
+        """
+
+        # Reference weight: ``GroupedTensor`` ``weight`` (single_grouped_weight=True),
+        # otherwise the per-group ``weight0``.
+        ref_weight = self.weight if self.single_grouped_weight else self.weight0
+        if ref_weight is None:
+            raise RuntimeError(
+                "GroupedLinear.reset_parameters() could not find a reference weight parameter."
+            )
+
+        # Determine target real device. If params live on meta, materialize
+        # the grouped weight/bias storage on the default CUDA device first.
+        weight_dtype = ref_weight.dtype
+        device = ref_weight.device
         if device.type == "meta":
             device = canonicalize_device(None)
+            if self.single_grouped_weight:
+                self._register_single_grouped_weight(device=device, dtype=weight_dtype)
+            if self.use_bias and self.single_grouped_bias and self.bias.device.type == "meta":
+                self._register_single_grouped_bias(device=device, dtype=weight_dtype)
 
-        # Initialize weight values
-        # Note: Allocate a single buffer in order to support grouped
-        # GEMM kernels that expect a single weight buffer.
+        # Allocate a packed buffer to host kaiming_uniform values for all
+        # groups. The packed layout supports grouped GEMM kernels that
+        # expect a single contiguous weight buffer (per-group path) and
+        # also serves as the source we copy from for the single-grouped
+        # path (where we write the initialized values back into the
+        # already-registered ``self.weight`` storage).
         packed_weights = torch.empty(
             self.num_groups,
             self.out_features,
             self.in_features,
-            dtype=self.weight0.dtype,
+            dtype=weight_dtype,
             device=device,
         )
         weights = [packed_weights[idx] for idx in range(self.num_groups)]
@@ -304,7 +336,7 @@ class GroupedLinear(BasicOperation):
             with init_context:
                 torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
 
-        # Quantize weights if needed
+        # Quantize weights if needed (for quantized parameter storage).
         if self._with_quantized_weight:
 
             # Configure quantizers
@@ -331,30 +363,49 @@ class GroupedLinear(BasicOperation):
             # Quantize weights
             weights = self._quantize_weights(weights, quantizers)
 
-        # Register weights
-        for group_idx, weight in enumerate(weights):
-            if not isinstance(weight, torch.nn.Parameter):
-                weight = torch.nn.Parameter(weight)
-            setattr(self, f"weight{group_idx}", weight)
+        # Place initialized values onto the registered parameters.
+        if self.single_grouped_weight:
+            # Copy in-place into ``self.weight``'s per-group views,
+            # preserving the registered ``weight`` parameter object.
+            grouped_views = self.weight.quantized_tensors
+            if grouped_views is None:
+                grouped_views = self.weight.split_into_quantized_tensors()
+            with torch.no_grad():
+                for group_idx, weight in enumerate(weights):
+                    if self._with_quantized_weight:
+                        grouped_views[group_idx].copy_from_storage(weight)
+                    else:
+                        grouped_views[group_idx].copy_(weight)
+        else:
+            # Re-register per-group weight params (needed because quantization
+            # may have changed the tensor type, and to expose the packed
+            # backing buffer to grouped GEMM kernels).
+            for group_idx, weight in enumerate(weights):
+                if not isinstance(weight, torch.nn.Parameter):
+                    weight = torch.nn.Parameter(weight)
+                setattr(self, f"weight{group_idx}", weight)
 
-        # Initialize biases if needed
-        packed_biases: Optional[torch.Tensor] = None
+        # Initialize biases if needed.
         if self.use_bias:
-            if self.bias0 is not None:
-                bias_dtype = self.bias0.dtype
-            elif getattr(self, "bias", None) is not None:
-                bias_dtype = self.bias.dtype
-            elif getattr(self, "weight", None) is not None:
-                bias_dtype = self.weight.dtype
+            if self.single_grouped_bias:
+                # Zero-init in-place into ``self.bias``'s per-group views.
+                bias_views = self.bias.quantized_tensors
+                if bias_views is None:
+                    bias_views = self.bias.split_into_quantized_tensors()
+                with torch.no_grad():
+                    for view in bias_views:
+                        view.detach().zero_()
             else:
-                bias_dtype = self.weight0.dtype
-            packed_biases = torch.zeros(
-                self.num_groups,
-                self.out_features,
-                dtype=bias_dtype,
-                device=device,
-            )
-            if not self.single_grouped_bias:
+                if self.bias0 is not None:
+                    bias_dtype = self.bias0.dtype
+                else:
+                    bias_dtype = weight_dtype
+                packed_biases = torch.zeros(
+                    self.num_groups,
+                    self.out_features,
+                    dtype=bias_dtype,
+                    device=device,
+                )
                 for group_idx in range(self.num_groups):
                     bias = torch.nn.Parameter(packed_biases[group_idx])
                     setattr(self, f"bias{group_idx}", bias)
@@ -362,21 +413,23 @@ class GroupedLinear(BasicOperation):
             for group_idx in range(self.num_groups):
                 self.register_parameter(f"bias{group_idx}", None)
 
-        if self.single_grouped_weight:
-            self.make_grouped_weights()
-        if self.use_bias and self.single_grouped_bias:
-            assert packed_biases is not None
-            self._make_grouped_biases_from_packed(packed_biases)
         self._apply_delay_wgrad_param_hooks()
 
-    def make_grouped_weights(self) -> None:
-        """
-        Convert parameters into a GroupedTensor and re-register them as parameters.
-        """
+    def _register_single_grouped_weight(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Register ``self.weight`` as a single ``GroupedTensor`` parameter.
 
-        weights = [getattr(self, f"weight{idx}") for idx in range(self.num_groups)]
+        Allocates the underlying storage on ``device`` (which may be
+        ``meta``) but does not initialize values; ``reset_parameters``
+        is responsible for value initialization. Used both during
+        ``__init__`` and when materializing a meta-device weight onto a
+        real device in ``reset_parameters``.
+        """
         quantizer = self.get_quantizer("forward", 1)
-
         recipe = None if quantizer is None else quantizer._get_compatible_recipe()
         if recipe is not None and (recipe.delayed() or recipe.float8_current_scaling()):
             raise RuntimeError(
@@ -384,46 +437,44 @@ class GroupedLinear(BasicOperation):
                 " single_grouped_weight=True"
             )
 
-        grouped_weights = GroupedTensor.make_grouped_tensor_with_shapes(
+        grouped_weight = GroupedTensor.make_grouped_tensor_with_shapes(
             num_tensors=self.num_groups,
             shapes=[(self.out_features, self.in_features)] * self.num_groups,
             quantizer=quantizer,
-            dtype=self.weight0.dtype,
-            device=self.weight0.device,
+            dtype=dtype,
+            device=device,
         )
-
-        # Copy existing params into storage.
-        with torch.no_grad():
-            for i in range(self.num_groups):
-                if self._with_quantized_weight:
-                    grouped_weights.quantized_tensors[i].copy_from_storage(weights[i])
-                else:
-                    grouped_weights.quantized_tensors[i].copy_(weights[i])
-
-        assert isinstance(grouped_weights, torch.Tensor) and (
+        assert isinstance(grouped_weight, torch.Tensor) and (
             quantizer is None or not quantizer.internal
         ), "Found internal quantizer with `single_grouped_weight=True`."
 
-        # Re-register as a single grouped weight parameter.
-        self.register_parameter("weight", torch.nn.Parameter(grouped_weights))
-        for group_idx in range(self.num_groups):
-            self.register_parameter(f"weight{group_idx}", None)
+        self.register_parameter("weight", torch.nn.Parameter(grouped_weight))
 
-        self._apply_delay_wgrad_param_hooks()
+    def _register_single_grouped_bias(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Register ``self.bias`` as a single ``GroupedTensor`` parameter.
 
-    def _make_grouped_biases_from_packed(self, packed_biases: torch.Tensor) -> None:
-        """Replace per-group bias parameters with one ``GroupedTensor`` (``single_grouped_bias``)."""
-        bias_data = packed_biases.detach().clone().contiguous()
+        Allocates the underlying storage on ``device`` (which may be
+        ``meta``) but does not zero-initialize values; ``reset_parameters``
+        handles in-place zeroing once a real-device buffer is available.
+        """
+        bias_data = torch.empty(
+            self.num_groups * self.out_features,
+            dtype=dtype,
+            device=device,
+        )
         grouped_bias = GroupedTensor.make_grouped_tensor_from_rowwise_data(
             num_tensors=self.num_groups,
             tensor_shape=(self.out_features,),
             rowwise_data=bias_data,
-            dtype=bias_data.dtype,
+            dtype=dtype,
         )
         grouped_bias.requires_grad_(True)
         self.register_parameter("bias", torch.nn.Parameter(grouped_bias))
-        for group_idx in range(self.num_groups):
-            self.register_parameter(f"bias{group_idx}", None)
 
     def _quantize_weights(
         self,
@@ -1036,13 +1087,17 @@ class GroupedLinear(BasicOperation):
                     )
                 else:
                     grad_weight = None
-                # Be mindful of param registration order.
+                # Be mindful of param registration order: with
+                # ``single_grouped_weight=True`` we register ``self.weight``
+                # first in ``__init__`` (then ``weight{i}=None`` placeholders,
+                # then biases), so the grouped weight grad comes before the
+                # bias grads.
                 if has_bias:
                     if self.single_grouped_bias:
                         final_bias_grads = torch.stack(grad_biases, dim=0).to(ctx.dtype)
                         grad_params = [grad_weight, final_bias_grads]
                     else:
-                        grad_params = grad_biases + [grad_weight]
+                        grad_params = [grad_weight] + grad_biases
                 else:
                     grad_params = [grad_weight]
                 grad_extra = (None, grad_scales) if self._scale_bias else (None,)
@@ -1077,10 +1132,9 @@ class GroupedLinear(BasicOperation):
             final_bias_grads = torch.stack(grad_biases, dim=0).to(ctx.dtype)
             grad_params = list(final_weight_grads) + [final_bias_grads]
         else:
-            if self.single_grouped_weight:
-                grad_params = list(grad_biases) + list(final_weight_grads)
-            else:
-                grad_params = list(final_weight_grads) + list(grad_biases)
+            # Param registration order is ``weight{i}`` (or ``weight``)
+            # then ``bias{i}``, so grads follow the same order.
+            grad_params = list(final_weight_grads) + list(grad_biases)
 
         grad_extra = (None, grad_scales) if self._scale_bias else (None,)
         return grad_input, [grad_params], [grad_extra]
