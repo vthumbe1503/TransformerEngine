@@ -300,36 +300,36 @@ def _cudnn_compute_wgrad(
         else:
             # Multi-group NVFP4 columnwise data is stored group-major as
             # (logical_K, group_M / 2) chunks. The cuDNN wgrad wrapper expects
-            # one tensor concatenated across the grouped-token K dimension, so
-            # assemble that layout explicitly.
-            split_sizes_int = [
-                int(size) for size in grouped_dy.first_dims.detach().cpu().tolist()
-            ]
-            dy_data = grouped_dy.columnwise_data.view(dtype=data_dtype)
-            x_data = grouped_x.columnwise_data.view(dtype=data_dtype)
-            dy_parts = []
-            x_parts = []
-            dy_offset = 0
-            x_offset = 0
-            for group_tokens in split_sizes_int:
-                group_tokens_packed = group_tokens // 2
-                dy_numel = out_features * group_tokens_packed
-                x_numel = in_features * group_tokens_packed
-                if dy_numel > 0:
-                    dy_parts.append(
-                        dy_data.narrow(0, dy_offset, dy_numel).view(
-                            out_features, group_tokens_packed
-                        )
-                    )
-                    x_parts.append(
-                        x_data.narrow(0, x_offset, x_numel).view(
-                            in_features, group_tokens_packed
-                        )
-                    )
-                dy_offset += dy_numel
-                x_offset += x_numel
-            a_tensor = torch.cat(dy_parts, dim=1)
-            b_tensor = torch.cat(x_parts, dim=1).T
+            # one tensor concatenated across the grouped-token K dimension.
+            # Keep split handling on device so CUDA graph capture does not sync.
+            device = grouped_dy.columnwise_data.device
+            packed_sizes = grouped_dy.first_dims.to(device=device, dtype=torch.int64) // 2
+            packed_ends = torch.cumsum(packed_sizes, dim=0)
+            packed_starts = packed_ends - packed_sizes
+            packed_cols = torch.arange(total_tokens // 2, device=device, dtype=torch.int64)
+            group_ids = torch.bucketize(packed_cols, packed_ends, right=True)
+            group_packed_sizes = packed_sizes[group_ids]
+            col_offsets = packed_cols - packed_starts[group_ids]
+
+            dy_rows = torch.arange(out_features, device=device, dtype=torch.int64).unsqueeze(1)
+            dy_group_sizes = out_features * packed_sizes
+            dy_group_offsets = torch.cumsum(dy_group_sizes, dim=0) - dy_group_sizes
+            dy_indices = (
+                dy_group_offsets[group_ids].unsqueeze(0)
+                + dy_rows * group_packed_sizes.unsqueeze(0)
+                + col_offsets.unsqueeze(0)
+            )
+            a_tensor = grouped_dy.columnwise_data.view(-1)[dy_indices].view(dtype=data_dtype)
+
+            x_rows = torch.arange(in_features, device=device, dtype=torch.int64).unsqueeze(1)
+            x_group_sizes = in_features * packed_sizes
+            x_group_offsets = torch.cumsum(x_group_sizes, dim=0) - x_group_sizes
+            x_indices = (
+                x_group_offsets[group_ids].unsqueeze(0)
+                + x_rows * group_packed_sizes.unsqueeze(0)
+                + col_offsets.unsqueeze(0)
+            )
+            b_tensor = grouped_x.columnwise_data.view(-1)[x_indices].view(dtype=data_dtype).T
     else:
         # a_tensor = DY^T = (out_features, total_tokens) row-major
         a_tensor = grouped_dy.columnwise_data.view(dtype=data_dtype).view(
