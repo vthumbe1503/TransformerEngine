@@ -137,10 +137,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   NVTE_DECLARE_COMMON_PYBIND11_HANDLES(m)
   m.def("quantize", transformer_engine::pytorch::quantize, py::arg("tensor"), py::arg("quantizer"),
         py::arg("output") = py::none(), py::arg("noop") = py::none());
+  m.def("quantize_with_amax", transformer_engine::pytorch::quantize_with_amax,
+        py::arg("tensor"), py::arg("quantizer"), py::arg("rowwise_amax"),
+        py::arg("columnwise_amax"));
   m.def("dequantize", &transformer_engine::pytorch::dequantize, "Dequantize", py::arg("input"),
         py::arg("otype"));
   m.def("group_quantize", transformer_engine::pytorch::group_quantize, py::arg("tensor"),
         py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"));
+  m.def("group_quantize_with_amax", transformer_engine::pytorch::group_quantize_with_amax,
+        py::arg("tensor"), py::arg("quantizer"), py::arg("num_tensors"),
+        py::arg("first_dims"), py::arg("rowwise_amax"), py::arg("columnwise_amax"));
   m.def("group_dequantize", transformer_engine::pytorch::group_dequantize,
         "Dequantize group tensor", py::arg("input"), py::arg("otype"));
   m.def("bgrad_group_quantize", transformer_engine::pytorch::bgrad_group_quantize,
