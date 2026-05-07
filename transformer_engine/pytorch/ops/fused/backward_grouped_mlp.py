@@ -286,50 +286,15 @@ def _cudnn_compute_wgrad(
     sf_vec_size = NVFP4_BLOCK_SCALING_SIZE if use_nvfp4 else MXFP8_BLOCK_SCALING_SIZE
 
     if use_nvfp4:
-        if grouped_dy.num_tensors == 1:
-            # NVFP4 columnwise data is physically (logical_K, logical_M / 2).
-            # cuDNN's FP4x2 descriptor expands the innermost contiguous dimension.
-            a_tensor = grouped_dy.columnwise_data.view(dtype=data_dtype).view(
-                out_features, total_tokens // 2
-            )
-            b_tensor = (
-                grouped_x.columnwise_data.view(dtype=data_dtype)
-                .view(in_features, total_tokens // 2)
-                .T
-            )
-        else:
-            # Multi-group NVFP4 columnwise data is stored group-major as
-            # (logical_K, group_M / 2) chunks. The cuDNN wgrad wrapper expects
-            # one tensor concatenated across the grouped-token K dimension.
-            # Keep split handling on device so CUDA graph capture does not sync.
-            device = grouped_dy.columnwise_data.device
-            packed_sizes = grouped_dy.first_dims.to(device=device, dtype=torch.int64) // 2
-            packed_ends = torch.cumsum(packed_sizes, dim=0)
-            packed_starts = packed_ends - packed_sizes
-            packed_cols = torch.arange(total_tokens // 2, device=device, dtype=torch.int64)
-            group_ids = torch.bucketize(packed_cols, packed_ends, right=True)
-            group_packed_sizes = packed_sizes[group_ids]
-            col_offsets = packed_cols - packed_starts[group_ids]
-
-            dy_rows = torch.arange(out_features, device=device, dtype=torch.int64).unsqueeze(1)
-            dy_group_sizes = out_features * packed_sizes
-            dy_group_offsets = torch.cumsum(dy_group_sizes, dim=0) - dy_group_sizes
-            dy_indices = (
-                dy_group_offsets[group_ids].unsqueeze(0)
-                + dy_rows * group_packed_sizes.unsqueeze(0)
-                + col_offsets.unsqueeze(0)
-            )
-            a_tensor = grouped_dy.columnwise_data.view(-1)[dy_indices].view(dtype=data_dtype)
-
-            x_rows = torch.arange(in_features, device=device, dtype=torch.int64).unsqueeze(1)
-            x_group_sizes = in_features * packed_sizes
-            x_group_offsets = torch.cumsum(x_group_sizes, dim=0) - x_group_sizes
-            x_indices = (
-                x_group_offsets[group_ids].unsqueeze(0)
-                + x_rows * group_packed_sizes.unsqueeze(0)
-                + col_offsets.unsqueeze(0)
-            )
-            b_tensor = grouped_x.columnwise_data.view(-1)[x_indices].view(dtype=data_dtype).T
+        # NVFP4 columnwise data is stored expert-major as per-expert
+        # (logical_K, group_M / 2) chunks. cuDNN consumes that layout directly
+        # with input_order="tensor_ragged".
+        a_tensor = grouped_dy.columnwise_data.view(dtype=data_dtype).view(
+            out_features, total_tokens // 2
+        )
+        b_tensor = grouped_x.columnwise_data.view(dtype=data_dtype).view(
+            in_features, total_tokens // 2
+        ).T
     else:
         # a_tensor = DY^T = (out_features, total_tokens) row-major
         a_tensor = grouped_dy.columnwise_data.view(dtype=data_dtype).view(
@@ -360,44 +325,40 @@ def _cudnn_compute_wgrad(
             grouped_x.columnwise_amax.view(-1).to(torch.float32) / global_scale_denom
         )
 
+    common_wgrad_kwargs = {
+        "a_tensor": a_tensor,
+        "b_tensor": b_tensor,
+        "sfa_tensor": sfa_tensor,
+        "sfb_tensor": sfb_tensor,
+        "offsets_tensor": offsets,
+        "global_scale_a": global_scale_a,
+        "global_scale_b": global_scale_b,
+        "acc_dtype": torch.float32,
+        "sf_vec_size": sf_vec_size,
+        "accumulate_on_output": accumulate,
+        "current_stream": current_stream,
+    }
+    if use_nvfp4:
+        common_wgrad_kwargs["input_order"] = "tensor_ragged"
+
     # Prepare wgrad output
     if single_grouped_weight:
         # Dense mode: single (num_groups, out_features, in_features) tensor
         wgrad_tensor = wgrad_output.rowwise_data.view(offsets.shape[0], out_features, in_features)
         wgrad_kernel_fn(
-            a_tensor=a_tensor,
-            b_tensor=b_tensor,
-            sfa_tensor=sfa_tensor,
-            sfb_tensor=sfb_tensor,
-            offsets_tensor=offsets,
+            **common_wgrad_kwargs,
             output_mode="dense",
             wgrad_tensor=wgrad_tensor,
-            global_scale_a=global_scale_a,
-            global_scale_b=global_scale_b,
-            acc_dtype=torch.float32,
             wgrad_dtype=wgrad_tensor.dtype,
-            sf_vec_size=sf_vec_size,
-            accumulate_on_output=accumulate,
-            current_stream=current_stream,
         )
     else:
         # Discrete mode: per-expert wgrad device pointers
         (wgrad_ptrs,) = tex.convert_host_pointers_to_tensor([wgrad_output])
         wgrad_kernel_fn(
-            a_tensor=a_tensor,
-            b_tensor=b_tensor,
-            sfa_tensor=sfa_tensor,
-            sfb_tensor=sfb_tensor,
-            offsets_tensor=offsets,
+            **common_wgrad_kwargs,
             output_mode="discrete",
             wgrad_ptrs=wgrad_ptrs,
-            global_scale_a=global_scale_a,
-            global_scale_b=global_scale_b,
-            acc_dtype=torch.float32,
             wgrad_dtype=wgrad_output[0].dtype,
-            sf_vec_size=sf_vec_size,
-            accumulate_on_output=accumulate,
-            current_stream=current_stream,
         )
 
 
