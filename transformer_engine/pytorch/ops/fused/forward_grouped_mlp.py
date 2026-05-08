@@ -68,7 +68,8 @@ def _enable_nvfp4_rht_for_group_quantize(quantizer: Quantizer) -> None:
 
 
 def _wrap_single_nvfp4_as_grouped(
-    quantized: NVFP4Tensor,
+    tensor: torch.Tensor,
+    quantized: Any,
     quantizer: NVFP4Quantizer,
     split_sizes: Optional[torch.Tensor],
     *,
@@ -89,32 +90,32 @@ def _wrap_single_nvfp4_as_grouped(
     if split_sizes is None:
         split_sizes = torch.full(
             (1,),
-            quantized.shape[0],
+            tensor.shape[0],
             dtype=torch.int64,
-            device=quantized.device,
+            device=tensor.device,
         )
     else:
-        split_sizes = split_sizes.to(dtype=torch.int64, device=quantized.device)
+        split_sizes = split_sizes.to(dtype=torch.int64, device=tensor.device)
 
-    m_dim = quantized.shape[0]
+    m_dim = tensor.shape[0]
     if rowwise_data is not None:
         k_dim = rowwise_data.shape[-1] * 2
     elif columnwise_data is not None:
         k_dim = columnwise_data.shape[0]
     else:
-        k_dim = quantized.shape[-1]
+        k_dim = tensor.shape[-1]
 
     if tensor_offsets is None:
         tensor_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.int64, device=quantized.device),
+                torch.zeros(1, dtype=torch.int64, device=tensor.device),
                 torch.cumsum(split_sizes * k_dim, dim=0),
             ],
         )
 
     return GroupedTensor(
         shape=(m_dim, k_dim),
-        dtype=quantized.dtype,
+        dtype=tensor.dtype,
         quantizer=quantizer,
         num_tensors=1,
         data=rowwise_data.reshape(-1) if rowwise_data is not None else None,
@@ -145,6 +146,7 @@ def _group_quantize_for_grouped_mlp(
 
     quantized = tex.quantize(tensor, quantizer)
     return _wrap_single_nvfp4_as_grouped(
+        tensor,
         quantized,
         quantizer,
         split_sizes,
@@ -180,6 +182,7 @@ def _group_quantize_with_amax_for_grouped_mlp(
         columnwise_amax.view(-1)[:1],
     )
     return _wrap_single_nvfp4_as_grouped(
+        tensor,
         quantized,
         quantizer,
         split_sizes,
