@@ -54,6 +54,49 @@ def _pack_nvfp4_amax_list(tensors: list) -> None:
             tensor._amax_columnwise = packed_col_amax[idx : idx + 1]
 
 
+def _debug_grouped_mlp_enabled() -> bool:
+    if os.environ.get("NVTE_FUSED_GROUPED_MLP_DEBUG", "0") != "1":
+        return False
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+    except RuntimeError:
+        pass
+    rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    debug_rank = int(os.environ.get("NVTE_FUSED_GROUPED_MLP_DEBUG_RANK", "0"))
+    return debug_rank < 0 or rank == debug_rank
+
+
+def _debug_grouped_mlp_tensor(name: str, tensor: torch.Tensor, *, prefix: str) -> None:
+    if not _debug_grouped_mlp_enabled():
+        return
+    token_count = int(
+        os.environ.get(
+            "NVTE_FUSED_GROUPED_MLP_DEBUG_TOKENS",
+            os.environ.get("NVTE_FUSED_DENSE_MLP_DEBUG_TOKENS", "4"),
+        )
+    )
+    data = tensor.detach()
+    if data.dim() > 1 and token_count > 0:
+        data = data[:token_count]
+    if os.environ.get("NVTE_FUSED_GROUPED_MLP_DEBUG_FULL", "0") == "1":
+        data = tensor.detach()
+    values = data.float()
+    finite = torch.isfinite(values)
+    sample = values.reshape(-1)[:8].cpu().tolist()
+    print(
+        f"{prefix} {name}: shape={tuple(tensor.shape)} sample_shape={tuple(data.shape)} "
+        f"dtype={tensor.dtype} mean={values.mean().item():.8e} "
+        f"std={values.std(unbiased=False).item():.8e} "
+        f"min={values.min().item():.8e} max={values.max().item():.8e} "
+        f"amax={values.abs().max().item():.8e} sum={values.sum().item():.8e} "
+        f"finite={finite.sum().item()}/{finite.numel()} sample={sample}",
+        flush=True,
+    )
+
+
 def _enable_nvfp4_rht_for_group_quantize(quantizer: Quantizer) -> None:
     """Use the graph-safe NVFP4 grouped quantization path.
 
@@ -595,6 +638,15 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         enable_fc1_glu_hadamard = (
             int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP_FC1_GLU_RHT_AMAX", "0")) > 0
         )
+        use_tmem_post_rht_amax = (
+            int(
+                os.environ.get(
+                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP_FC1_GLU_RHT_AMAX_TMEM",
+                    "0",
+                )
+            )
+            > 0
+        )
         fc1_glu_hadamard_kernel = (
             self.grouped_gemm_glu_hadamard_kernel() if enable_fc1_glu_hadamard else None
         )
@@ -624,7 +676,9 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             "act_func": self._cudnn_act_func,
             "use_dynamic_sched": True,
         }
-        if not use_fc1_glu_hadamard:
+        if use_fc1_glu_hadamard:
+            fc1_glu_kwargs["use_tmem_post_rht_amax"] = use_tmem_post_rht_amax
+        else:
             fc1_glu_kwargs["norm_const_tensor"] = fc1_norm_const_tensor
             fc1_glu_kwargs["discrete_col_sfd"] = not use_nvfp4
 
@@ -699,7 +753,17 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             # re-quantize to NVFP4 to feed the FC2 grouped GEMM and to provide
             # a columnwise tile for FC2 wgrad.
             fc2_in = fc1_kernel_out["d_tensor"]
-            fc2_in = fc2_in.view(in_shape[0], fc2_weight_shape[1]).contiguous()
+            fc2_in = fc2_in.view(in_shape[0], fc2_weight_shape[1])
+            _debug_grouped_mlp_tensor(
+                "fc1_post_glu_d_tensor",
+                fc2_in,
+                prefix=(
+                    "[TEFusedGroupedMLPDebug "
+                    f"fc1_glu_rht_amax={int(use_fc1_glu_hadamard)} "
+                    f"num_groups={num_groups}]"
+                ),
+            )
+            fc2_in = fc2_in.contiguous()
             fc2_input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
             fc2_input_quantizer.optimize_for_gemm = True
             _enable_nvfp4_rht_for_group_quantize(fc2_input_quantizer)
