@@ -1341,3 +1341,5 @@ def fuse_backward_srelu_ops(
 # Register fusion if available
 if BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8.is_supported():
     register_backward_fusion(fuse_backward_ops, prepend=True)
+if BackwardGroupedMLP_CuTeGEMMDSReLU_MXFP8.is_supported():
+    register_backward_fusion(fuse_backward_srelu_ops, prepend=True)

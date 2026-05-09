@@ -206,10 +206,6 @@ def fuse_grouped_mlp_ops(
             matches_pattern = False
         elif isinstance(window[1], SReLU) and window[1].cache_quantized_input:
             matches_pattern = False
-        elif isinstance(window[1], (SReLU, ScaledSReLU)) and (
-            window[0].has_bias or window[2].has_bias
-        ):
-            matches_pattern = False
         elif (
             isinstance(window[1], SReLU)
             and not isinstance(window[1], ScaledSReLU)

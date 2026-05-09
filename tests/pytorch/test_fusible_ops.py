@@ -3591,7 +3591,7 @@ class TestSequentialModules:
             quantization == "mxfp8"
             and dtype in (torch.bfloat16, torch.float16)
             and (
-                (activation == "scaled_srelu" and glu_interleave_size is None and not bias)
+                (activation == "scaled_srelu" and glu_interleave_size is None)
                 or (activation != "scaled_srelu" and glu_interleave_size == 32)
             )
             and (
@@ -3601,7 +3601,7 @@ class TestSequentialModules:
         ):
             if activation == "scaled_srelu":
                 forward_cls = te_ops.fused.ForwardGroupedMLP_CuTeGEMMSReLU_MXFP8
-                backward_cls = None
+                backward_cls = te_ops.fused.BackwardGroupedMLP_CuTeGEMMDSReLU_MXFP8
             else:
                 forward_cls = te_ops.fused.ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
                 backward_cls = te_ops.fused.BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8

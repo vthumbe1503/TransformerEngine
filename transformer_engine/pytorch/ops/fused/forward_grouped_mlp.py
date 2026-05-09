@@ -67,6 +67,20 @@ def _enable_nvfp4_rht_for_group_quantize(quantizer: Quantizer) -> None:
         quantizer.with_post_rht_amax = True
 
 
+@functools.lru_cache(maxsize=1)
+def _grouped_gemm_dsrelu_backward_supported() -> bool:
+    """Whether the cuDNN FE grouped GEMM dSReLU backward wrapper is available."""
+    if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+        return False
+    if get_device_compute_capability()[0] != 10:
+        return False
+    try:
+        from cudnn import grouped_gemm_dsrelu_wrapper_sm100  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
+    return grouped_gemm_dsrelu_wrapper_sm100 is not None
+
+
 def _wrap_single_nvfp4_as_grouped(
     tensor: torch.Tensor,
     quantized: Any,
@@ -1087,7 +1101,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             mark_grouped_tensor(grouped_fc1_x, swiglu_in, scales, grouped_fc2_x)
             activation_is_srelu = isinstance(self.basic_ops[1], (SReLU, ScaledSReLU))
 
-            if activation_is_srelu:
+            if activation_is_srelu and not _grouped_gemm_dsrelu_backward_supported():
                 _debug_srelu_fc2_x(grouped_fc2_x)
                 fc1_x_members = (
                     _split_grouped_tensor_for_basic_backward(grouped_fc1_x)
