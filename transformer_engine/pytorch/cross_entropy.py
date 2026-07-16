@@ -142,6 +142,21 @@ def parallel_cross_entropy(
         )
         inp = _input
 
+    # torch.autograd.Function.forward always runs with grad mode disabled, so determine
+    # here whether backward will be needed. Forward-only execution does not need the
+    # full-sized FP32 gradient buffer.
+    if not torch.is_grad_enabled() or not inp.requires_grad:
+        loss, _ = triton_cross_entropy.cross_entropy_forward(
+            inp,
+            target,
+            label_smoothing,
+            reduce_loss,
+            dist_process_group,
+            ignore_idx,
+            compute_grad=False,
+        )
+        return loss
+
     return CrossEntropyFunction.apply(
         inp,
         target,

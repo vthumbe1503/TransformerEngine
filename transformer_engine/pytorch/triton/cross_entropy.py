@@ -30,6 +30,7 @@ def cross_entropy_forward(
     reduce_loss: bool,
     dist_process_group: Union[dist.ProcessGroup, None],
     ignore_idx: int,
+    compute_grad: bool = True,
 ):
     """Forward implementation of Cross Entropy kernel"""
 
@@ -55,7 +56,8 @@ def cross_entropy_forward(
         target = target.contiguous()
 
     # Store the input gradient in FP32 so it is not quantized before backward.
-    grad_input = torch.empty_like(_input, dtype=torch.float32)
+    # In forward-only execution, avoid allocating this potentially large buffer.
+    grad_input = torch.empty_like(_input, dtype=torch.float32) if compute_grad else None
 
     rank = 0 if dist_process_group is None else dist.get_rank(dist_process_group)
 
@@ -89,8 +91,9 @@ def cross_entropy_forward(
     cross_entropy_kernel[(n_rows,)](
         X_ptr=_input,
         X_stride=_input.stride(-2),
-        grad_input_ptr=grad_input,
-        grad_input_stride=grad_input.stride(-2),
+        # Triton requires a valid pointer even when compute_grad specializes away all accesses.
+        grad_input_ptr=grad_input if compute_grad else _input,
+        grad_input_stride=grad_input.stride(-2) if compute_grad else _input.stride(-2),
         Y_ptr=target,
         Y_stride=target.stride(-1),
         loss_ptr=loss_1d,
@@ -105,6 +108,7 @@ def cross_entropy_forward(
         n_non_ignore=n_non_ignore,
         reduce_loss=reduce_loss,
         label_smoothing=label_smoothing,
+        compute_grad=compute_grad,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=32,
     )

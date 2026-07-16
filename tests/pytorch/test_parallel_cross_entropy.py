@@ -220,6 +220,34 @@ def test_bfloat16_unreduced_external_grad():
     torch.testing.assert_close(logits.grad, expected_grad, rtol=0.0, atol=0.0)
 
 
+def test_no_grad_skips_grad_input_allocation(monkeypatch):
+    """Forward-only execution should not allocate the full-sized FP32 gradient buffer."""
+    logits = torch.randn(2, 4, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    target = torch.randint(0, logits.size(-1), logits.shape[:-1], device="cuda")
+    real_empty_like = torch.empty_like
+    grad_input_allocations = 0
+
+    def track_empty_like(input_tensor, *args, **kwargs):
+        nonlocal grad_input_allocations
+        if input_tensor.shape == logits.shape and kwargs.get("dtype") == torch.float32:
+            grad_input_allocations += 1
+        return real_empty_like(input_tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_like", track_empty_like)
+    with torch.no_grad():
+        loss = parallel_cross_entropy(logits, target, 0.1, False, None)
+        reference = torch.nn.functional.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            target.reshape(-1),
+            reduction="none",
+            label_smoothing=0.1,
+        ).reshape_as(target)
+
+    assert not loss.requires_grad
+    assert grad_input_allocations == 0
+    torch.testing.assert_close(loss, reference)
+
+
 def test_bfloat16_loss_matches_float32_input():
     """BF16 and exactly equivalent FP32 logits should produce nearly identical losses."""
     torch.manual_seed(42)

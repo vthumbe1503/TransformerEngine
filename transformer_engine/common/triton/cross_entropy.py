@@ -102,6 +102,7 @@ def cross_entropy_kernel(
     n_non_ignore,
     reduce_loss: tl.constexpr,
     label_smoothing: tl.constexpr,
+    compute_grad: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -125,6 +126,7 @@ def cross_entropy_kernel(
     n_rows (int): The number of rows in the batch (B * SQ), used for buffer indexing.
     n_non_ignore: The number of non-ignored elements in the batch.
     label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
+    compute_grad (bool): Whether to compute and store the input gradient.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
 
@@ -140,10 +142,11 @@ def cross_entropy_kernel(
     y = tl.load(Y_ptr)
 
     if y == ignore_idx:
-        # Set the input gradient to zero.
-        for i in range(0, n_cols, BLOCK_SIZE):
-            X_offsets = i + tl.arange(0, BLOCK_SIZE)
-            tl.store(grad_input_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
+        if compute_grad:
+            # Set the input gradient to zero.
+            for i in range(0, n_cols, BLOCK_SIZE):
+                X_offsets = i + tl.arange(0, BLOCK_SIZE)
+                tl.store(grad_input_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
         return
 
     loss_ptr += program_id * loss_stride
@@ -169,7 +172,8 @@ def cross_entropy_kernel(
     scaled_x_sum = 0.0
     eps = label_smoothing / (n_cols * world_size)
 
-    # 4. [Online softmax] second pass: calculate the gradients
+    # 4. [Online softmax] second pass: calculate the gradients when needed.
+    # Label smoothing also needs this pass to calculate the loss.
     # dx_y = (softmax(x_y) - 1) / N
     # dx_i = softmax(x_i) / N, i != y
     # N is the number of non ignored elements in the batch
@@ -177,24 +181,27 @@ def cross_entropy_kernel(
     # dx_i = (softmax(x_y) - label_smoothing / V) / N, V = n_cols, i != y
     # dx_y = (softmax(x_y) - label_smoothing / V - (1 - label_smoothing)) / N
     #      = dx_i - (1 - label_smoothing) / N
-    for i in range(0, n_cols, BLOCK_SIZE):
-        X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
-        X_block = X_block.to(tl.float32)
-        if label_smoothing > 0:
-            # scale X beforehand to avoid overflow
-            scaled_x_sum += tl.sum(tl.where(X_offsets < n_cols, -eps * X_block, 0.0))
-        # Scale gradients based on reduction mode
-        # For reduce_loss=True: PyTorch will scale by 1/n_rows, so we need to scale by n_rows/n_non_ignore
-        # For reduce_loss=False: No additional scaling from PyTorch, so we don't scale here
-        if reduce_loss:
-            X_block = (tl.exp(X_block - m) / d - eps) / (n_non_ignore)
-        else:
-            X_block = tl.exp(X_block - m) / d - eps
-        tl.store(grad_input_ptr + X_offsets, X_block, mask=X_offsets < n_cols)
+    if compute_grad or label_smoothing > 0:
+        for i in range(0, n_cols, BLOCK_SIZE):
+            X_offsets = i + tl.arange(0, BLOCK_SIZE)
+            X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
+            X_block = X_block.to(tl.float32)
+            if label_smoothing > 0:
+                # scale X beforehand to avoid overflow
+                scaled_x_sum += tl.sum(tl.where(X_offsets < n_cols, -eps * X_block, 0.0))
+            if compute_grad:
+                # Scale gradients based on reduction mode
+                # For reduce_loss=True: PyTorch will scale by 1/n_rows, so we need to scale by n_rows/n_non_ignore
+                # For reduce_loss=False: No additional scaling from PyTorch, so we don't scale here
+                if reduce_loss:
+                    X_block = (tl.exp(X_block - m) / d - eps) / (n_non_ignore)
+                else:
+                    X_block = tl.exp(X_block - m) / d - eps
+                tl.store(grad_input_ptr + X_offsets, X_block, mask=X_offsets < n_cols)
 
-    # Ensure the gradient is written before updating the target-token element.
-    tl.debug_barrier()
+        if compute_grad:
+            # Ensure the gradient is written before updating the target-token element.
+            tl.debug_barrier()
 
     # 5. Calculate the loss
 
@@ -213,17 +220,18 @@ def cross_entropy_kernel(
         loss = loss * (1 - label_smoothing) + smooth_loss
 
     # 6. Specially handle the i==y case where `dx_y = (softmax(x_y) - (1 - label_smoothing) / N`
-    vocab_start_idx = rank * n_cols
-    vocab_end_idx = (rank + 1) * n_cols
-    if y >= vocab_start_idx:
-        if y < vocab_end_idx:
-            X_y = tl.load(grad_input_ptr + y - vocab_start_idx)
-            # Apply the same conditional scaling logic for the target token
-            if reduce_loss:
-                X_y += -(1 - label_smoothing) / (n_non_ignore)
-            else:
-                X_y += -(1 - label_smoothing)
-            tl.store(grad_input_ptr + y - vocab_start_idx, X_y)
+    if compute_grad:
+        vocab_start_idx = rank * n_cols
+        vocab_end_idx = (rank + 1) * n_cols
+        if y >= vocab_start_idx:
+            if y < vocab_end_idx:
+                X_y = tl.load(grad_input_ptr + y - vocab_start_idx)
+                # Apply the same conditional scaling logic for the target token
+                if reduce_loss:
+                    X_y += -(1 - label_smoothing) / (n_non_ignore)
+                else:
+                    X_y += -(1 - label_smoothing)
+                tl.store(grad_input_ptr + y - vocab_start_idx, X_y)
 
     tl.store(loss_ptr, loss)
 
