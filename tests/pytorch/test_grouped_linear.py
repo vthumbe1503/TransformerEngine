@@ -1516,6 +1516,33 @@ def _clone_outputs(outputs):
     return [None if out is None else out.detach().clone() for out in outputs]
 
 
+def _skip_if_fused_grouped_path_unsupported(fp8_recipe) -> None:
+    """Shared SM / cuBLAS / recipe guards for the graph-safe fused GroupedLinear path."""
+    use_fp8 = fp8_recipe is not None
+    device_capability = torch.cuda.get_device_capability()
+    if not (9, 0) <= device_capability <= (11, 0):
+        pytest.skip(
+            "GroupedTensor grouped GEMM path requires Hopper (SM90) or Blackwell (SM10x and SM110)."
+        )
+    # MXFP8/NVFP4 grouped quantization kernels require Blackwell; FP8 per-tensor
+    # current scaling runs on Hopper and Blackwell; FP8 block scaling is Hopper-only.
+    is_current_scaling = use_fp8 and fp8_recipe.float8_current_scaling()
+    is_block_scaling = use_fp8 and fp8_recipe.float8_block_scaling()
+    if is_block_scaling and not (9, 0) <= device_capability < (10, 0):
+        pytest.skip("Fused grouped FP8 block-scaling requires Hopper (SM90).")
+    if use_fp8 and not is_current_scaling and not is_block_scaling and device_capability < (10, 0):
+        pytest.skip(
+            "Quantized GroupedTensor grouped GEMM path (MXFP8/NVFP4) requires Blackwell (SM100+)."
+        )
+    cublaslt_version = tex.get_cublasLt_version()
+    if device_capability < (10, 0) and cublaslt_version < 130400:
+        pytest.skip("Grouped GEMM on Hopper requires cuBLAS 13.4+.")
+    if is_current_scaling and device_capability < (10, 0) and cublaslt_version < 130500:
+        pytest.skip("FP8 per-tensor scaling grouped GEMM on Hopper requires cuBLAS 13.5+.")
+    if cublaslt_version < 130300:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.3+.")
+
+
 def _run_grouped_linear_path(
     *,
     enable_grouped_tensor_path: bool,
@@ -1529,6 +1556,8 @@ def _run_grouped_linear_path(
     biases,
     m_splits,
     monkeypatch,
+    fuse_wgrad_accumulation: bool = False,
+    main_grad_sentinels=None,
 ):
     FP8GlobalStateManager.reset()
     monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "1" if enable_grouped_tensor_path else "0")
@@ -1549,12 +1578,21 @@ def _run_grouped_linear_path(
             params_dtype=dtype,
             device="cuda",
             delay_wgrad_compute=delay_wgrad_compute,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
     with torch.no_grad():
         for i in range(num_gemms):
             getattr(grouped_linear, f"weight{i}").copy_(weights[i])
             if bias:
                 getattr(grouped_linear, f"bias{i}").copy_(biases[i])
+            if fuse_wgrad_accumulation:
+                weight_i = getattr(grouped_linear, f"weight{i}")
+                if main_grad_sentinels is None:
+                    weight_i.main_grad = torch.zeros(
+                        weight_i.size(), device=weight_i.device, dtype=torch.float32
+                    )
+                else:
+                    weight_i.main_grad = main_grad_sentinels[i].detach().clone()
 
     # The fused path is the graph-safe path and accepts a CUDA tensor for split metadata.
     # The legacy path still expects Python split sections in several places.
@@ -1571,7 +1609,12 @@ def _run_grouped_linear_path(
 
     outputs = [y, x.grad]
     for i in range(num_gemms):
-        outputs.append(getattr(grouped_linear, f"weight{i}").grad)
+        weight_i = getattr(grouped_linear, f"weight{i}")
+        if fuse_wgrad_accumulation:
+            assert weight_i.grad is None  # wgrad is fused into main_grad
+            outputs.append(weight_i.main_grad)
+        else:
+            outputs.append(weight_i.grad)
         if bias:
             outputs.append(getattr(grouped_linear, f"bias{i}").grad)
     return _clone_outputs(outputs)
@@ -1609,28 +1652,7 @@ def test_grouped_linear_grouped_tensor_path_matches_legacy(
     fp8_recipe, bias, fp8_model_params, delay_wgrad_compute, monkeypatch
 ):
     use_fp8 = fp8_recipe is not None
-    device_capability = torch.cuda.get_device_capability()
-    if not (9, 0) <= device_capability <= (11, 0):
-        pytest.skip(
-            "GroupedTensor grouped GEMM path requires Hopper (SM90) or Blackwell (SM10x and SM110)."
-        )
-    # MXFP8/NVFP4 grouped quantization kernels require Blackwell; FP8 per-tensor
-    # current scaling runs on Hopper and Blackwell; FP8 block scaling is Hopper-only.
-    is_current_scaling = use_fp8 and fp8_recipe.float8_current_scaling()
-    is_block_scaling = use_fp8 and fp8_recipe.float8_block_scaling()
-    if is_block_scaling and not (9, 0) <= device_capability < (10, 0):
-        pytest.skip("Fused grouped FP8 block-scaling requires Hopper (SM90).")
-    if use_fp8 and not is_current_scaling and not is_block_scaling and device_capability < (10, 0):
-        pytest.skip(
-            "Quantized GroupedTensor grouped GEMM path (MXFP8/NVFP4) requires Blackwell (SM100+)."
-        )
-    cublaslt_version = tex.get_cublasLt_version()
-    if device_capability < (10, 0) and cublaslt_version < 130400:
-        pytest.skip("Grouped GEMM on Hopper requires cuBLAS 13.4+.")
-    if is_current_scaling and device_capability < (10, 0) and cublaslt_version < 130500:
-        pytest.skip("FP8 per-tensor scaling grouped GEMM on Hopper requires cuBLAS 13.5+.")
-    if cublaslt_version < 130300:
-        pytest.skip("Grouped GEMM requires cuBLAS 13.3+.")
+    _skip_if_fused_grouped_path_unsupported(fp8_recipe)
 
     if fp8_model_params and not use_fp8:
         pytest.skip("fp8_model_params requires FP8")
@@ -1689,6 +1711,87 @@ def test_grouped_linear_grouped_tensor_path_matches_legacy(
         assert grouped_tensor_out is not None
         assert legacy_out is not None
         torch.testing.assert_close(grouped_tensor_out.float(), legacy_out.float(), **tols)
+
+
+@pytest.mark.parametrize(
+    "fp8_recipe",
+    [
+        None,
+        pytest.param(
+            recipe.Float8CurrentScaling(),
+            marks=pytest.mark.skipif(not _fp8_available, reason=_reason_for_no_fp8),
+        ),
+        pytest.param(
+            recipe.Float8BlockScaling(),
+            marks=pytest.mark.skipif(
+                not _fp8_block_scaling_available, reason=_reason_for_no_fp8_block_scaling
+            ),
+        ),
+    ],
+    ids=["bf16", "fp8_current_scaling", "fp8_block_scaling"],
+)
+@pytest.mark.parametrize("delay_wgrad_compute", _ALL_BOOLEAN)
+def test_grouped_linear_fused_path_fuse_wgrad_accumulation(
+    fp8_recipe, delay_wgrad_compute, monkeypatch
+):
+    """Graph-safe fused GroupedLinear path with fuse_wgrad_accumulation.
+
+    Compares fused vs legacy ``main_grad`` accumulation for BF16 and the Hopper
+    FP8 recipes (per-tensor current scaling and FP8 block scaling).
+    """
+    use_fp8 = fp8_recipe is not None
+    _skip_if_fused_grouped_path_unsupported(fp8_recipe)
+
+    dtype = torch.bfloat16
+    num_gemms = 3
+    in_features = 128
+    out_features = 128
+    m_splits = [128, 256, 384]
+    total_tokens = sum(m_splits)
+
+    torch.manual_seed(1234)
+    x_base = (0.1 * torch.randn(total_tokens, in_features, device="cuda")).to(dtype)
+    dy = (0.1 * torch.randn(total_tokens, out_features, device="cuda")).to(dtype)
+    weights = [
+        (0.1 * torch.randn(out_features, in_features, device="cuda")).to(dtype)
+        for _ in range(num_gemms)
+    ]
+    # Non-zero sentinel so we verify accumulation into the existing main_grad buffer.
+    main_grad_sentinels = [
+        torch.full((out_features, in_features), 0.5, device="cuda", dtype=torch.float32)
+        for _ in range(num_gemms)
+    ]
+
+    common_kwargs = dict(
+        fp8_recipe=fp8_recipe,
+        bias=False,
+        fp8_model_params=False,
+        delay_wgrad_compute=delay_wgrad_compute,
+        x_base=x_base,
+        dy=dy,
+        weights=weights,
+        biases=None,
+        m_splits=m_splits,
+        monkeypatch=monkeypatch,
+        fuse_wgrad_accumulation=True,
+        main_grad_sentinels=main_grad_sentinels,
+    )
+    outputs_legacy = _run_grouped_linear_path(enable_grouped_tensor_path=False, **common_kwargs)
+    outputs_fused = _run_grouped_linear_path(enable_grouped_tensor_path=True, **common_kwargs)
+
+    tols = dict(rtol=1e-2, atol=5e-3)
+    if use_fp8:
+        tols = dict(rtol=0.05, atol=0.05)
+    for fused_out, legacy_out in zip(outputs_fused, outputs_legacy):
+        assert fused_out is not None
+        assert legacy_out is not None
+        torch.testing.assert_close(fused_out.float(), legacy_out.float(), **tols)
+
+    # main_grad should have accumulated on top of the 0.5 sentinel (not overwritten).
+    for main_grad in outputs_fused[2:]:
+        assert not torch.allclose(
+            main_grad, torch.full_like(main_grad, 0.5)
+        ), "main_grad was not updated by fused wgrad accumulation"
 
 
 def test_grouped_linear_grouped_tensor_path_single_grouped_bias_delay_wgrad(monkeypatch):
@@ -1928,31 +2031,13 @@ def test_grouped_linear_grouped_tensor_path_skips_non_rht_nvfp4(monkeypatch):
     ids=["bf16", "fp8_current_scaling", "mxfp8", "nvfp4", "fp8_block_scaling"],
 )
 @pytest.mark.parametrize("bias", _ALL_BOOLEAN)
-def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch):
+@pytest.mark.parametrize("fuse_wgrad_accumulation", _ALL_BOOLEAN)
+def test_grouped_linear_fused_path_cuda_graph_safe(
+    fp8_recipe, bias, fuse_wgrad_accumulation, monkeypatch
+):
     """Fused GroupedTensor GEMM path should be CUDA graph capturable."""
     use_fp8 = fp8_recipe is not None
-    device_capability = torch.cuda.get_device_capability()
-    if not (9, 0) <= device_capability <= (11, 0):
-        pytest.skip(
-            "GroupedTensor grouped GEMM path requires Hopper (SM90) or Blackwell (SM10x and SM110)."
-        )
-    # MXFP8/NVFP4 grouped quantization kernels require Blackwell; FP8 per-tensor
-    # current scaling runs on Hopper and Blackwell; FP8 block scaling is Hopper-only.
-    is_current_scaling = use_fp8 and fp8_recipe.float8_current_scaling()
-    is_block_scaling = use_fp8 and fp8_recipe.float8_block_scaling()
-    if is_block_scaling and not (9, 0) <= device_capability < (10, 0):
-        pytest.skip("Fused grouped FP8 block-scaling requires Hopper (SM90).")
-    if use_fp8 and not is_current_scaling and not is_block_scaling and device_capability < (10, 0):
-        pytest.skip(
-            "Quantized GroupedTensor grouped GEMM path (MXFP8/NVFP4) requires Blackwell (SM100+)."
-        )
-    cublaslt_version = tex.get_cublasLt_version()
-    if device_capability < (10, 0) and cublaslt_version < 130400:
-        pytest.skip("Grouped GEMM on Hopper requires cuBLAS 13.4+.")
-    if is_current_scaling and device_capability < (10, 0) and cublaslt_version < 130500:
-        pytest.skip("FP8 per-tensor scaling grouped GEMM on Hopper requires cuBLAS 13.5+.")
-    if cublaslt_version < 130300:
-        pytest.skip("Grouped GEMM requires cuBLAS 13.3+.")
+    _skip_if_fused_grouped_path_unsupported(fp8_recipe)
 
     monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "1")
     FP8GlobalStateManager.reset()
@@ -1973,6 +2058,7 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
         bias=bias,
         params_dtype=dtype,
         device=device,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
     )
     reference_grouped_linear = GroupedLinear(
         num_gemms,
@@ -1981,8 +2067,24 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
         bias=bias,
         params_dtype=dtype,
         device=device,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
     )
     reference_grouped_linear.load_state_dict(grouped_linear.state_dict())
+
+    def _weight_params(module: torch.nn.Module) -> list[torch.nn.Parameter]:
+        return [getattr(module, f"weight{i}") for i in range(num_gemms)]
+
+    def _init_main_grads(module: torch.nn.Module, value: float = 0.0) -> None:
+        if not fuse_wgrad_accumulation:
+            return
+        with torch.no_grad():
+            for w in _weight_params(module):
+                if getattr(w, "main_grad", None) is None:
+                    w.main_grad = torch.empty(w.size(), device=device, dtype=torch.float32)
+                w.main_grad.fill_(value)
+
+    def _collect_main_grads(module: torch.nn.Module) -> list[torch.Tensor]:
+        return [w.main_grad.detach().clone() for w in _weight_params(module)]
 
     static_x = torch.randn(total_tokens, in_features, dtype=dtype, device=device)
     static_x.requires_grad_(True)
@@ -2012,6 +2114,8 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
         out_buf.copy_(out)
         return out_buf
 
+    _init_main_grads(grouped_linear, 0.0)
+
     graphed_grouped_linear = te.make_graphed_callables(
         grouped_linear,
         (static_x, static_m_splits),
@@ -2027,6 +2131,7 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
         static_dy.copy_(fresh_dy)
 
     _zero_grads()
+    _init_main_grads(grouped_linear, 0.5)
     graph_out = (
         _train_step(
             static_x,
@@ -2039,9 +2144,15 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
     )
     torch.cuda.synchronize()
     graph_dx = static_x.grad.detach().clone()
-    graph_param_grads = _clone_param_grads()
+    if fuse_wgrad_accumulation:
+        graph_main_grads = _collect_main_grads(grouped_linear)
+        graph_param_grads: list[torch.Tensor] = []
+    else:
+        graph_main_grads = []
+        graph_param_grads = _clone_param_grads()
 
     _zero_grads()
+    _init_main_grads(reference_grouped_linear, 0.5)
     expected_x = fresh_x.detach().clone().requires_grad_(True)
     expected_dy = fresh_dy.detach().clone()
     with autocast(enabled=use_fp8, recipe=fp8_recipe):
@@ -2053,9 +2164,13 @@ def test_grouped_linear_fused_path_cuda_graph_safe(fp8_recipe, bias, monkeypatch
         tols = dict(rtol=0.05, atol=0.05)
     torch.testing.assert_close(graph_out.float(), expected_out.float(), **tols)
     torch.testing.assert_close(graph_dx.float(), expected_x.grad.float(), **tols)
-    for graph_grad, param in zip(graph_param_grads, reference_grouped_linear.parameters()):
-        assert param.grad is not None
-        torch.testing.assert_close(graph_grad.float(), param.grad.float(), **tols)
+    if fuse_wgrad_accumulation:
+        for graph_grad, weight in zip(graph_main_grads, _weight_params(reference_grouped_linear)):
+            torch.testing.assert_close(graph_grad.float(), weight.main_grad.float(), **tols)
+    else:
+        for graph_grad, param in zip(graph_param_grads, reference_grouped_linear.parameters()):
+            assert param.grad is not None
+            torch.testing.assert_close(graph_grad.float(), param.grad.float(), **tols)
 
 
 @pytest.mark.skipif(not _fp8_block_scaling_available, reason=_reason_for_no_fp8_block_scaling)
