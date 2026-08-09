@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import torch
 
@@ -67,7 +67,7 @@ class Dispatch(BasicOperation):
         prev_op_grad_output_quantizer: Optional[Quantizer],
         next_op_input_quantizer: Optional[Quantizer],
         basic_op_kwargs: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, Iterable[Iterable[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Sequence[Sequence[torch.Tensor]]]:
         del prev_op_grad_output_quantizer, next_op_input_quantizer
         topk_idx, topk_weights = basic_op_extra_inputs[0]
         kwargs = basic_op_kwargs[0]

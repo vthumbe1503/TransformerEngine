@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 import abc
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 import dataclasses
 import pickle
 from typing import Any, Optional
@@ -89,7 +89,7 @@ class FusibleOperation(torch.nn.Module, metaclass=abc.ABCMeta):
         prev_op_grad_output_quantizer: Optional[Quantizer],
         next_op_input_quantizer: Optional[Quantizer],
         basic_op_kwargs: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, Iterable[Iterable[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Sequence[Sequence[torch.Tensor]]]:
         """Forward pass
 
         This op is either a basic op or the fusion of basic ops, so
@@ -118,7 +118,7 @@ class FusibleOperation(torch.nn.Module, metaclass=abc.ABCMeta):
         -------
         torch.Tensor:
             Output tensor.
-        Iterable of torch.Tensor:
+        Sequence of torch.Tensor:
             Extra tensor outputs from basic operations.
 
         """
