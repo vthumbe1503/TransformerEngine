@@ -317,6 +317,20 @@ def run_benchmark(cfg: BenchConfig) -> None:
         num_topk=cfg.topk,
         recv_capacity_per_rank=cfg.recv_capacity,
     )
+    try:
+        _run_benchmark_body(cfg, ep_group)
+    finally:
+        if dist.is_initialized():
+            try:
+                dist.barrier(group=ep_group)
+            except Exception:
+                pass
+            ep_finalize()
+            release_symm_mem_pool()
+            dist.destroy_process_group()
+
+
+def _run_benchmark_body(cfg: BenchConfig, ep_group: dist.ProcessGroup) -> None:
     buffer = EpBuffer(
         top_k=cfg.topk,
         max_tokens_per_rank=cfg.tokens_per_rank,
@@ -474,11 +488,6 @@ def run_benchmark(cfg: BenchConfig) -> None:
         f"  (local rank0: e2e {tokens_in_per_s:.1f} tok/s, mlp {recv_per_s:.1f} tok/s)",
     )
     del lo, hi, lo_m, hi_m
-
-    dist.barrier(group=ep_group)
-    ep_finalize()
-    release_symm_mem_pool()
-    dist.destroy_process_group()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
