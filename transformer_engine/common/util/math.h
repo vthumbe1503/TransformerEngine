@@ -125,7 +125,7 @@ __device__ inline OType dsitu_up(const IType val, const SiTUGLUParam& p) {
 
 template <typename OType, typename IType>
 __device__ inline OType clamped_dsilu(const IType val, const ClampedSwiGLUParam& p) {
-  const bool dclamp_val = static_cast<float>(val) <= p.limit;
+  const bool dclamp_val = static_cast<float>(val) < p.limit;
   const float clamp_val = min(static_cast<float>(val), p.limit);
   const float dsilu_val = dqgelu_with_alpha<OType, float>(clamp_val, p.alpha);
   return dclamp_val ? dsilu_val : 0.0f;

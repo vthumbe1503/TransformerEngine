@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
       float gate_elt = static_cast<float>(in_gate_sh_curr[shmem_idx]);
       float dgate_elt = 1.0f;  // gating is ideally an identity function
       if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-        if (gate_elt > p.limit || gate_elt < -p.limit) {
+        if (gate_elt >= p.limit || gate_elt <= -p.limit) {
           dgate_elt = 0.f;
         }
         gate_elt = min(max(-p.limit, gate_elt), p.limit) + p.glu_linear_offset;
@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
           const float x = min(act_elt, p.limit);
           const float s = sigmoidf(p.alpha * x);
           act_x = x * s;
-          if (act_elt <= p.limit) {
+          if (act_elt < p.limit) {
             dact_x = s + s * (1 - s) * p.alpha * x;
           } else {
             dact_x = 0.0f;

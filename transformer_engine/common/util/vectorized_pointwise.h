@@ -544,7 +544,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
       if constexpr (std::is_same<Param, ClampedSwiGLUParam>::value) {
         const ComputeType limit = p.limit;
-        dgate_in = gate_in <= limit && gate_in >= -limit;
+        dgate_in = gate_in < limit && gate_in > -limit;
         gate_in = std::min(std::max(-limit, gate_in), limit) + p.glu_linear_offset;
       } else if constexpr (std::is_same<Param, SiTUGLUParam>::value) {
         dgate_in = dsitu_up<ComputeType, ComputeType>(gate_in, p);

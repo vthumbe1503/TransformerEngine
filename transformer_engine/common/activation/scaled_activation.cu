@@ -78,7 +78,7 @@ __device__ __forceinline__ void gated_backward_values(const float act_in, const 
   float dgate_elt = 1.0f;
 
   if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-    if (gate_in > param.limit || gate_in < -param.limit) {
+    if (gate_in >= param.limit || gate_in <= -param.limit) {
       dgate_elt = 0.f;
     }
     gate_elt = fminf(fmaxf(-param.limit, gate_in), param.limit) + param.glu_linear_offset;
@@ -88,7 +88,7 @@ __device__ __forceinline__ void gated_backward_values(const float act_in, const 
   }
 
   if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-    const bool dact_mask = act_in <= param.limit;
+    const bool dact_mask = act_in < param.limit;
     const float clamped_act_in = fminf(act_in, param.limit);
     const float s = sigmoid<float, float>(param.alpha * clamped_act_in, empty);
     act_elt = clamped_act_in * s;

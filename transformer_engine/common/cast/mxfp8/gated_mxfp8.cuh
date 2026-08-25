@@ -243,7 +243,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
         float after_gate_elt;
         float dgate_elt = 1.0f;  // gating is ideally an identity function
         if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-          if (gate_elt > p.limit || gate_elt < -p.limit) {
+          if (gate_elt >= p.limit || gate_elt <= -p.limit) {
             dgate_elt = 0.f;
           }
           gate_elt = min(max(-p.limit, gate_elt), p.limit) + p.glu_linear_offset;
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
             const float x = min(act_elt, p.limit);
             const float s = sigmoidf(p.alpha * x);
             act_x = x * s;
-            dact_x = act_elt <= p.limit ? s + s * (1 - s) * p.alpha * x : 0.0f;
+            dact_x = act_elt < p.limit ? s + s * (1 - s) * p.alpha * x : 0.0f;
           } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
             act_x = ActOP(x, p);
             dact_x = DActOP(x, p);
@@ -515,7 +515,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
             float after_gate_elt;
             float dgate_elt = 1.0f;
             if constexpr (std::is_same<ParamOP, ClampedSwiGLUParam>::value) {
-              dgate_elt = gate_elt <= p.limit && gate_elt >= -p.limit;
+              dgate_elt = gate_elt < p.limit && gate_elt > -p.limit;
               gate_elt = min(max(-p.limit, gate_elt), p.limit) + p.glu_linear_offset;
             } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
               dgate_elt = dsitu_up<float, float>(gate_elt, p);
@@ -530,7 +530,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
                 const float x = min(act_elt, p.limit);
                 const float s = sigmoidf(p.alpha * x);
                 act_x = x * s;
-                dact_x = act_elt <= p.limit ? s + s * (1 - s) * p.alpha * x : 0.0f;
+                dact_x = act_elt < p.limit ? s + s * (1 - s) * p.alpha * x : 0.0f;
               } else if constexpr (std::is_same<ParamOP, SiTUGLUParam>::value) {
                 act_x = ActOP(x, p);
                 dact_x = DActOP(x, p);
