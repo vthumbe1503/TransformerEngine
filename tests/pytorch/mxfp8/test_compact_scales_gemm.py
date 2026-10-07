@@ -76,15 +76,33 @@ def test_compact_scales_gemm(shape, layout, compact):
 
 @pytest.mark.skipif(not te.is_mxfp8_available(), reason="MXFP8 requires Blackwell")
 @pytest.mark.parametrize(
-    "shape", [(32, 32), (64, 64), (96, 160), (128, 128), (160, 96), (4096, 4128)]
+    "shape",
+    [
+        (32, 32),
+        (64, 64),
+        (96, 160),
+        (128, 128),
+        (160, 96),
+        (4096, 4128),
+        # Exercise the narrow and vectorized kernels with compact strides.
+        (300, 1024),
+        (300, 4224),
+        (300, 4352),
+        (300, 8192),
+        (300, 4232),
+        (300, 1000),
+        (300, 4097),
+    ],
 )
 @pytest.mark.parametrize("rowwise", [False, True])
 def test_compact_scale_swizzle_bytes(shape, rowwise):
     m, n = shape
-    scale_shape = (m, n // 32) if rowwise else (m // 32, n)
-    scales = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device="cuda")
+    if rowwise and n % 32 != 0:
+        pytest.skip("Row-wise MXFP8 scales require full 32-element blocks")
+    scale_shape = (m, (n + 31) // 32) if rowwise else ((m + 31) // 32, n)
     padded_m, padded_n = (m + 127) // 128 * 128, (n + 127) // 128 * 128
     padded_shape = (padded_m, padded_n // 32) if rowwise else (padded_m // 32, padded_n)
+    scales = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device="cuda")
     padded = torch.zeros(padded_shape, dtype=torch.uint8, device="cuda")
     padded[: scale_shape[0], : scale_shape[1]].copy_(scales)
     expected = swizzle_mxfp8_scale(padded_m, padded_n, padded, columnwise=not rowwise)
