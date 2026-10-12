@@ -216,6 +216,45 @@ static void zero_scale_inv_padding(uint8_t *buf,
   }
 }
 
+void performTestSwizzleNVFP4(const size_t M, const size_t K, bool rowwise) {
+  using namespace test;
+
+  Tensor input("input", {M, K}, DType::kFloat4E2M1, rowwise, !rowwise,
+               NVTE_NVFP4_1D_SCALING);
+  Tensor output("output", {M, K}, DType::kFloat4E2M1, rowwise, !rowwise,
+                NVTE_NVFP4_1D_SCALING);
+  output.set_with_gemm_swizzled_scales(true);
+  fillUniform(&input);
+  input.to_cpu();
+
+  const NVTEShape scale_shape =
+      rowwise ? input.rowwise_scale_inv_shape() : input.columnwise_scale_inv_shape();
+  uint8_t *input_scales = rowwise ? input.rowwise_cpu_scale_inv_ptr<uint8_t>()
+                                  : input.columnwise_cpu_scale_inv_ptr<uint8_t>();
+  zero_scale_inv_padding(input_scales, scale_shape.data[0], scale_shape.data[1],
+                         rowwise ? M : K, (rowwise ? K : M) / 16);
+  input.from_cpu();
+
+  std::vector<uint8_t> reference(scale_shape.data[0] * scale_shape.data[1]);
+  compute_ref_swizzle<128, 4, true>(input_scales, reference.data(), scale_shape.data[0],
+                                    scale_shape.data[1]);
+  nvte_swizzle_scaling_factors(input.data(), output.data(), 0);
+  NVTE_CHECK_CUDA(cudaDeviceSynchronize());
+  output.to_cpu();
+
+  const uint8_t *actual = rowwise ? output.rowwise_cpu_scale_inv_ptr<uint8_t>()
+                                  : output.columnwise_cpu_scale_inv_ptr<uint8_t>();
+  compareResults("nvfp4_swizzle", actual, reference.data(), reference.size());
+}
+
+TEST(SwizzleTest, NVFP4PerTileAndFallback) {
+  for (const auto &[M, K] :
+       std::vector<std::pair<size_t, size_t>>{{128, 128}, {160, 96}, {160, 6080}, {160, 6144}}) {
+    performTestSwizzleNVFP4(M, K, true);
+    performTestSwizzleNVFP4(M, K, false);
+  }
+}
+
 void performTestGroupedSwizzleMXFP8(const int num_tensors, const size_t M, const size_t K) {
   using namespace transformer_engine;
   using namespace test;
@@ -308,17 +347,9 @@ void performTestGroupedSwizzleMXFP8(const int num_tensors, const size_t M, const
                  num_tensors * col_numel);
 }
 
-// Sets NVTE_MXFP8_PER_TILE_SWIZZLE while it lives, so that MXFP8 swizzles use the per-tile
-// kernels (enable) or the default ones.
-class PerTileSwizzle {
- public:
-  explicit PerTileSwizzle(bool enable) {
-    setenv("NVTE_MXFP8_PER_TILE_SWIZZLE", enable ? "1" : "0", 1);
-  }
-  ~PerTileSwizzle() { unsetenv("NVTE_MXFP8_PER_TILE_SWIZZLE"); }
-};
-
-class SwizzleTestSuite : public ::testing::TestWithParam<std::tuple<std::pair<int, int>, std::pair<bool, bool>, bool, bool>> {};
+class SwizzleTestSuite
+    : public ::testing::TestWithParam<
+          std::tuple<std::pair<int, int>, std::pair<bool, bool>, bool>> {};
 
 
 TEST_P(SwizzleTestSuite, TestSwizzle) {
@@ -328,7 +359,6 @@ TEST_P(SwizzleTestSuite, TestSwizzle) {
   const auto num_tiles = std::get<0>(GetParam());
   const auto scaling_mode = std::get<1>(GetParam());
   const auto transa = std::get<2>(GetParam());
-  const PerTileSwizzle per_tile_swizzle(std::get<3>(GetParam()));
 
   performTestSwizzle1D(num_tiles.first, num_tiles.second,
                        scaling_mode.first, scaling_mode.second,
@@ -1007,14 +1037,14 @@ std::vector<std::pair<int, int>> num_tiles = {
   {65, 257},
   {65, 258},
   {65, 259},
-  // Additional narrow-path coverage: narrow_k (row) when num_tiles_K < 32,
-  // narrow_m (col) when num_tiles_M < 32.
-  {1, 4},     // narrow_k with 4 K-tiles
-  {1, 8},     // narrow_k with 8 K-tiles
-  {4, 1},     // narrow_m with 4 M-tiles
-  {8, 1},     // narrow_m with 8 M-tiles
-  {31, 1},    // narrow_m at boundary (31 < TB_DIM=32)
-  {1, 31},    // narrow_k at boundary (31 < TB_DIM=32)
+  {1, 4},
+  {1, 8},
+  {4, 1},
+  {8, 1},
+  {31, 1},
+  {1, 31},
+  {2, 95},    // Row-wise per-tile shared memory is below 48 KiB.
+  {2, 96},    // Row-wise falls back after shared-memory row padding.
   {1600, 1},  // MXFP8: more row-wise tiles than one CTA per tile allows
 };
 
@@ -1051,8 +1081,7 @@ INSTANTIATE_TEST_SUITE_P(
   ::testing::Combine(
     ::testing::ValuesIn(num_tiles),
     ::testing::ValuesIn(scaling_mode),
-    ::testing::ValuesIn(transa),
-    ::testing::Values(false, true)
+    ::testing::ValuesIn(transa)
   ),
   [](const testing::TestParamInfo<SwizzleTestSuite::ParamType>& info) {
     std::string name = "ntiles" +
@@ -1060,8 +1089,7 @@ INSTANTIATE_TEST_SUITE_P(
       std::to_string(std::get<0>(info.param).second) + "smode" +
       std::to_string(std::get<1>(info.param).first) + "X"+
       std::to_string(std::get<1>(info.param).second) + "trans" +
-      std::to_string(std::get<2>(info.param)) +
-      (std::get<3>(info.param) ? "PerTile" : "");
+      std::to_string(std::get<2>(info.param));
     return name;
     });
 

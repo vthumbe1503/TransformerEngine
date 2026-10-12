@@ -141,6 +141,104 @@ void performTestMultiTensorSwizzle(const int num_tensors, const size_t M, const 
   }
 }
 
+void performTestMultiTensorSwizzleNVFP4(const int num_tensors, const size_t M, const size_t K,
+                                        bool rowwise) {
+  using namespace test;
+  std::vector<std::unique_ptr<Tensor>> inputs;
+  std::vector<std::unique_ptr<Tensor>> outputs;
+  std::vector<NVTETensor> input_handles;
+  std::vector<NVTETensor> output_handles;
+
+  for (int i = 0; i < num_tensors; ++i) {
+    auto input = std::make_unique<Tensor>("input_" + std::to_string(i),
+                                          std::vector<size_t>{M, K}, DType::kFloat4E2M1, rowwise,
+                                          !rowwise, NVTE_NVFP4_1D_SCALING);
+    auto output = std::make_unique<Tensor>("output_" + std::to_string(i),
+                                           std::vector<size_t>{M, K}, DType::kFloat4E2M1, rowwise,
+                                           !rowwise, NVTE_NVFP4_1D_SCALING);
+    output->set_with_gemm_swizzled_scales(true);
+    fillUniform(input.get());
+    input->to_cpu();
+    const NVTEShape scale_shape =
+        rowwise ? input->rowwise_scale_inv_shape() : input->columnwise_scale_inv_shape();
+    uint8_t *scales = rowwise ? input->rowwise_cpu_scale_inv_ptr<uint8_t>()
+                              : input->columnwise_cpu_scale_inv_ptr<uint8_t>();
+    zero_scale_inv_padding(scales, scale_shape.data[0], scale_shape.data[1],
+                           rowwise ? M : K, (rowwise ? K : M) / 16);
+    input->from_cpu();
+    input_handles.push_back(input->data());
+    output_handles.push_back(output->data());
+    inputs.emplace_back(std::move(input));
+    outputs.emplace_back(std::move(output));
+  }
+
+  nvte_multi_tensor_swizzle_scaling_factors(input_handles.data(), output_handles.data(),
+                                            num_tensors, 0);
+  NVTE_CHECK_CUDA(cudaDeviceSynchronize());
+  for (int i = 0; i < num_tensors; ++i) {
+    outputs[i]->to_cpu();
+    const NVTEShape scale_shape =
+        rowwise ? inputs[i]->rowwise_scale_inv_shape() : inputs[i]->columnwise_scale_inv_shape();
+    const uint8_t *input_scales = rowwise ? inputs[i]->rowwise_cpu_scale_inv_ptr<uint8_t>()
+                                          : inputs[i]->columnwise_cpu_scale_inv_ptr<uint8_t>();
+    const uint8_t *actual = rowwise ? outputs[i]->rowwise_cpu_scale_inv_ptr<uint8_t>()
+                                    : outputs[i]->columnwise_cpu_scale_inv_ptr<uint8_t>();
+    std::vector<uint8_t> reference(scale_shape.data[0] * scale_shape.data[1]);
+    compute_ref_swizzle<128, 4, true>(input_scales, reference.data(), scale_shape.data[0],
+                                      scale_shape.data[1]);
+    compareResults("multi_nvfp4_swizzle", actual, reference.data(), reference.size());
+  }
+}
+
+TEST(MultiTensorSwizzleTest, NVFP4PerTileLaunchSplitting) {
+  for (const bool rowwise : {false, true}) {
+    performTestMultiTensorSwizzleNVFP4(4, 160, 96, rowwise);
+    performTestMultiTensorSwizzleNVFP4(65, 128, 128, rowwise);
+  }
+}
+
+TEST(MultiTensorSwizzleTest, RowwiseMixedSharedMemoryFallback) {
+  using namespace test;
+  const std::vector<std::pair<size_t, size_t>> shapes{{160, 12160}, {160, 12288}};
+  std::vector<std::unique_ptr<Tensor>> inputs;
+  std::vector<std::unique_ptr<Tensor>> outputs;
+  std::vector<NVTETensor> input_handles;
+  std::vector<NVTETensor> output_handles;
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    const auto [M, K] = shapes[i];
+    auto input = std::make_unique<Tensor>("input_" + std::to_string(i),
+                                          std::vector<size_t>{M, K}, DType::kFloat8E4M3, true,
+                                          false, NVTE_MXFP8_1D_SCALING);
+    auto output = std::make_unique<Tensor>("output_" + std::to_string(i),
+                                           std::vector<size_t>{M, K}, DType::kFloat8E4M3, true,
+                                           false, NVTE_MXFP8_1D_SCALING);
+    output->set_with_gemm_swizzled_scales(true);
+    fillUniform(input.get());
+    input->to_cpu();
+    const NVTEShape scale_shape = input->rowwise_scale_inv_shape();
+    zero_scale_inv_padding(input->rowwise_cpu_scale_inv_ptr<uint8_t>(), scale_shape.data[0],
+                           scale_shape.data[1], M, (K + 31) / 32);
+    input->from_cpu();
+    input_handles.push_back(input->data());
+    output_handles.push_back(output->data());
+    inputs.emplace_back(std::move(input));
+    outputs.emplace_back(std::move(output));
+  }
+
+  nvte_multi_tensor_swizzle_scaling_factors(
+      input_handles.data(), output_handles.data(), static_cast<int>(inputs.size()), 0);
+  NVTE_CHECK_CUDA(cudaDeviceSynchronize());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    outputs[i]->to_cpu();
+    const NVTEShape scale_shape = inputs[i]->rowwise_scale_inv_shape();
+    std::vector<uint8_t> reference(scale_shape.data[0] * scale_shape.data[1]);
+    compute_ref_swizzle<128, 4, true>(inputs[i]->rowwise_cpu_scale_inv_ptr<uint8_t>(),
+                                      reference.data(), scale_shape.data[0], scale_shape.data[1]);
+    compareResults("multi_rowwise_fallback", outputs[i]->rowwise_cpu_scale_inv_ptr<uint8_t>(),
+                   reference.data(), reference.size());
+  }
+}
+
 // ===================================================================
 // Multi-tensor unswizzle test (uses single-tensor swizzle to prepare)
 // ===================================================================
@@ -300,22 +398,11 @@ void performTestMultiTensorRoundtrip(const int num_tensors, const size_t M, cons
 // Test suites
 // ===================================================================
 
-// Sets NVTE_MXFP8_PER_TILE_SWIZZLE while it lives, so that MXFP8 swizzles use the per-tile
-// kernels (enable) or the default ones.
-class PerTileSwizzle {
- public:
-  explicit PerTileSwizzle(bool enable) {
-    setenv("NVTE_MXFP8_PER_TILE_SWIZZLE", enable ? "1" : "0", 1);
-  }
-  ~PerTileSwizzle() { unsetenv("NVTE_MXFP8_PER_TILE_SWIZZLE"); }
-};
-
 class MultiTensorSwizzleTestSuite
-    : public ::testing::TestWithParam<std::tuple<std::tuple<int, size_t, size_t, bool>, bool>> {};
+    : public ::testing::TestWithParam<std::tuple<int, size_t, size_t, bool>> {};
 
 TEST_P(MultiTensorSwizzleTestSuite, TestMultiTensorSwizzle) {
-  const auto& [num_tensors, M, K, rowwise] = std::get<0>(GetParam());
-  const PerTileSwizzle per_tile_swizzle(std::get<1>(GetParam()));
+  const auto& [num_tensors, M, K, rowwise] = GetParam();
   performTestMultiTensorSwizzle(num_tensors, M, K, rowwise);
 }
 
@@ -343,17 +430,7 @@ TEST_P(MultiTensorRoundtripTestSuite, TestMultiTensorRoundtrip) {
 
 namespace {
 
-// Shapes that exercise the narrow_k kernel (rowwise) / narrow_m kernel (colwise):
-//   Narrow-K fires when ALL tensors have scale num_tiles_k < TB_DIM (32),
-//   i.e. padded ceil(K/32) < 128.
-//   Narrow-M fires analogously for colwise when padded K < 4096
-//   (since colwise m = K padded to 128, num_tiles_m = m / 128 < 32).
-//
-// Shapes that bypass narrow and use the regular multi_tensor kernel:
-//   K >= 4096 makes num_tiles_k >= 32 (rowwise) and num_tiles_m >= 32 (colwise).
-
 std::vector<std::tuple<int, size_t, size_t, bool>> multi_tensor_test_cases = {
-    // --- Narrow path cases (K small → narrow_k for row, narrow_m for col) ---
     // M and K both aligned to 128
     {3, 256, 256, true},
     {3, 256, 256, false},
@@ -365,7 +442,7 @@ std::vector<std::tuple<int, size_t, size_t, bool>> multi_tensor_test_cases = {
     {3, 192, 256, false},
     {2, 64, 256, true},
     {2, 64, 256, false},
-    // Larger narrow K (num_tiles_k = 8, shared mem = 128 KB)
+    // Larger K
     {2, 128, 1024, true},
     {2, 128, 1024, false},
     // K not divisible by 128
@@ -380,7 +457,6 @@ std::vector<std::tuple<int, size_t, size_t, bool>> multi_tensor_test_cases = {
     {4, 32, 64, true},
     {4, 32, 64, false},
 
-    // --- Non-narrow path cases (K >= 4096 → regular multi_tensor kernel) ---
     {3, 256, 4096, true},
     {3, 256, 4096, false},
     {2, 128, 8192, true},
@@ -404,14 +480,12 @@ std::vector<std::tuple<int, size_t, size_t, bool>> multi_tensor_test_cases = {
 INSTANTIATE_TEST_SUITE_P(
     OperatorTest,
     MultiTensorSwizzleTestSuite,
-    ::testing::Combine(::testing::ValuesIn(multi_tensor_test_cases), ::testing::Values(false, true)),
+    ::testing::ValuesIn(multi_tensor_test_cases),
     [](const testing::TestParamInfo<MultiTensorSwizzleTestSuite::ParamType>& info) {
-      const auto& test_case = std::get<0>(info.param);
-      return "n" + std::to_string(std::get<0>(test_case)) +
-             "_M" + std::to_string(std::get<1>(test_case)) +
-             "_K" + std::to_string(std::get<2>(test_case)) +
-             (std::get<3>(test_case) ? "_row" : "_col") +
-             (std::get<1>(info.param) ? "_per_tile" : "");
+      return "n" + std::to_string(std::get<0>(info.param)) +
+             "_M" + std::to_string(std::get<1>(info.param)) +
+             "_K" + std::to_string(std::get<2>(info.param)) +
+             (std::get<3>(info.param) ? "_row" : "_col");
     });
 
 INSTANTIATE_TEST_SUITE_P(
