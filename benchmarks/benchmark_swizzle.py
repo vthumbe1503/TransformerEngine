@@ -45,7 +45,7 @@ class Case:
         return f"{self.scaling}_{self.direction}_{layout}_{self.m}x{self.k}_n{self.count}"
 
 
-def cases_for_preset(preset: str) -> list[Case]:
+def cases_for_preset(preset: str, include_compact: bool) -> list[Case]:
     cases = [
         Case("mxfp8", "rowwise", 128, 128),
         Case("mxfp8", "rowwise", 4096, 4096),
@@ -53,11 +53,14 @@ def cases_for_preset(preset: str) -> list[Case]:
         Case("mxfp8", "rowwise", 160, 12288),  # above it after bank-conflict padding
         Case("mxfp8", "columnwise", 128, 128),
         Case("mxfp8", "columnwise", 4224, 2048),
-        Case("mxfp8", "rowwise", 160, 96, compact=True),
-        Case("mxfp8", "columnwise", 160, 96, compact=True),
         Case("nvfp4", "rowwise", 128, 128),
         Case("nvfp4", "columnwise", 128, 128),
     ]
+    if include_compact:
+        cases += [
+            Case("mxfp8", "rowwise", 160, 96, compact=True),
+            Case("mxfp8", "columnwise", 160, 96, compact=True),
+        ]
     if preset == "full":
         cases += [
             Case("mxfp8", direction, m, k, count)
@@ -76,13 +79,16 @@ def cases_for_preset(preset: str) -> list[Case]:
             Case("mxfp8", "rowwise", 128, 128, 80),
             Case("mxfp8", "columnwise", 128, 128, 80),
             Case("mxfp8", "columnwise", 4224, 2048, 20),
-            Case("mxfp8", "rowwise", 288, 224, 4, compact=True),
-            Case("mxfp8", "columnwise", 288, 224, 4, compact=True),
             Case("nvfp4", "rowwise", 4096, 4096),
             Case("nvfp4", "columnwise", 4096, 4096),
             Case("nvfp4", "rowwise", 128, 128, 4),
             Case("nvfp4", "columnwise", 128, 128, 4),
         ]
+        if include_compact:
+            cases += [
+                Case("mxfp8", "rowwise", 288, 224, 4, compact=True),
+                Case("mxfp8", "columnwise", 288, 224, 4, compact=True),
+            ]
     return cases
 
 
@@ -154,7 +160,9 @@ def launch(tensors: list, case: Case) -> None:
         )
 
 
-def benchmark_case(case: Case, warmup: int, iterations: int) -> dict:
+def benchmark_case(
+    case: Case, warmup: int, iterations: int, calls_per_graph: int
+) -> dict:
     # Initialize CUDA contexts and allocator paths on a side stream with objects
     # that are not reused for graph capture.
     stream = torch.cuda.Stream()
@@ -165,10 +173,11 @@ def benchmark_case(case: Case, warmup: int, iterations: int) -> dict:
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
-    tensors = make_tensors(case)
+    graph_tensors = [make_tensors(case) for _ in range(calls_per_graph)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        launch(tensors, case)
+        for tensors in graph_tensors:
+            launch(tensors, case)
 
     for _ in range(warmup):
         graph.replay()
@@ -182,14 +191,17 @@ def benchmark_case(case: Case, warmup: int, iterations: int) -> dict:
     end.record()
     end.synchronize()
     total_ms = start.elapsed_time(end)
+    total_calls = iterations * calls_per_graph
     result = asdict(case)
     result.update(
         {
             "name": case.name,
             "iterations": iterations,
+            "calls_per_graph": calls_per_graph,
+            "timing": "cuda_graph_amortized",
             "total_ms": total_ms,
-            "us_per_call": total_ms * 1000.0 / iterations,
-            "us_per_tensor": total_ms * 1000.0 / (iterations * case.count),
+            "us_per_call": total_ms * 1000.0 / total_calls,
+            "us_per_tensor": total_ms * 1000.0 / (total_calls * case.count),
         }
     )
     return result
@@ -268,6 +280,17 @@ def main() -> None:
     parser.add_argument("--preset", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument(
+        "--calls-per-graph",
+        type=int,
+        default=16,
+        help="Swizzle calls captured per graph to amortize graph replay overhead",
+    )
+    parser.add_argument(
+        "--include-compact",
+        action="store_true",
+        help="Include compact outer-dimension cases (unsupported by the pre-PR baseline)",
+    )
     parser.add_argument("--output", type=Path, default=Path("swizzle_benchmark.json"))
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"), type=Path)
@@ -280,8 +303,8 @@ def main() -> None:
         raise RuntimeError("A CUDA GPU is required")
 
     results = []
-    for case in cases_for_preset(args.preset):
-        row = benchmark_case(case, args.warmup, args.iterations)
+    for case in cases_for_preset(args.preset, args.include_compact):
+        row = benchmark_case(case, args.warmup, args.iterations, args.calls_per_graph)
         results.append(row)
         print(f"{case.name:45s} {row['us_per_call']:9.3f} us/call")
     payload = {"metadata": metadata(), "preset": args.preset, "results": results}
@@ -291,3 +314,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
