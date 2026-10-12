@@ -131,6 +131,8 @@ def cases_for_preset(preset: str, include_compact: bool) -> list[Case]:
             Case("mxfp8", "rowwise", 128, 128, 65),
             Case("mxfp8", "columnwise", 128, 128, 64),
             Case("mxfp8", "columnwise", 128, 128, 65),
+            Case("mxfp8", "rowwise", 2048, 7168, 15),
+            Case("mxfp8", "rowwise", 2048, 7168, 16),
             Case(
                 "mxfp8",
                 "rowwise",

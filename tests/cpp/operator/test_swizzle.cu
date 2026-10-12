@@ -254,12 +254,16 @@ TEST(SwizzleTest, NVFP4PerTileAndFallback) {
     performTestSwizzleNVFP4(M, K, true);
     performTestSwizzleNVFP4(M, K, false);
   }
-  performTestSwizzleNVFP4(160, 4032, true);    // 31.5 KiB, 2 tiles: regular fallback.
+  performTestSwizzleNVFP4(160, 3584, true);    // 28.5 KiB, 2 tiles: per-tile rowwise.
+  performTestSwizzleNVFP4(2048, 3584, true);   // 28.5 KiB, 16 tiles: per-tile rowwise.
+  performTestSwizzleNVFP4(2176, 3584, true);   // 28.5 KiB, 17 tiles: regular fallback.
+  performTestSwizzleNVFP4(160, 4032, true);    // 31.5 KiB: regular fallback.
   performTestSwizzleNVFP4(160, 4096, true);    // 32.5 KiB: regular fallback.
-  performTestSwizzleNVFP4(2048, 4032, true);   // 31.5 KiB, 16 tiles: per-tile rowwise.
-  performTestSwizzleNVFP4(4032, 160, false);   // 31.5 KiB, 2 tiles: regular fallback.
+  performTestSwizzleNVFP4(3584, 160, false);   // 28.5 KiB, 2 tiles: per-tile transposed.
+  performTestSwizzleNVFP4(3584, 2048, false);  // 28.5 KiB, 16 tiles: per-tile transposed.
+  performTestSwizzleNVFP4(3584, 2176, false);  // 28.5 KiB, 17 tiles: regular fallback.
+  performTestSwizzleNVFP4(4032, 160, false);   // 31.5 KiB: regular fallback.
   performTestSwizzleNVFP4(4096, 160, false);   // 32.5 KiB: regular fallback.
-  performTestSwizzleNVFP4(4032, 2048, false);  // 31.5 KiB, 16 tiles: per-tile transposed.
 }
 
 void performTestGroupedSwizzleMXFP8(const int num_tensors, const size_t M, const size_t K) {
