@@ -1525,8 +1525,8 @@ bool multi_tensor_per_tile_swizzle(const std::vector<Tensor*>& input, std::vecto
     const int block_size = nvfp4 ? NVFP4_BLOCK_SIZE : MXFP8_BLOCK_SIZE;
     const bool logical_rowwise = use_rowwise_buffer;
     const int original_m = static_cast<int>(logical_rowwise ? first_dim : last_dim);
-    const int original_k =
-        static_cast<int>(DIVUP(logical_rowwise ? last_dim : first_dim, block_size));
+    const int original_k = static_cast<int>(
+        DIVUP(logical_rowwise ? last_dim : first_dim, static_cast<size_t>(block_size)));
     const int padded_m =
         scales_are_row_major
             ? static_cast<int>(round_up_to_multiple(static_cast<size_t>(original_m), 128))
