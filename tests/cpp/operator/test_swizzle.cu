@@ -254,10 +254,12 @@ TEST(SwizzleTest, NVFP4PerTileAndFallback) {
     performTestSwizzleNVFP4(M, K, true);
     performTestSwizzleNVFP4(M, K, false);
   }
-  performTestSwizzleNVFP4(160, 4032, true);   // 31.5 KiB: per-tile rowwise.
-  performTestSwizzleNVFP4(160, 4096, true);   // 32.5 KiB: regular rowwise fallback.
-  performTestSwizzleNVFP4(4032, 160, false);  // 31.5 KiB: per-tile transposed columnwise.
-  performTestSwizzleNVFP4(4096, 160, false);  // 32.5 KiB: regular transposed fallback.
+  performTestSwizzleNVFP4(160, 4032, true);    // 31.5 KiB, 2 tiles: regular fallback.
+  performTestSwizzleNVFP4(160, 4096, true);    // 32.5 KiB: regular fallback.
+  performTestSwizzleNVFP4(2048, 4032, true);   // 31.5 KiB, 16 tiles: per-tile rowwise.
+  performTestSwizzleNVFP4(4032, 160, false);   // 31.5 KiB, 2 tiles: regular fallback.
+  performTestSwizzleNVFP4(4096, 160, false);   // 32.5 KiB: regular fallback.
+  performTestSwizzleNVFP4(4032, 2048, false);  // 31.5 KiB, 16 tiles: per-tile transposed.
 }
 
 void performTestGroupedSwizzleMXFP8(const int num_tensors, const size_t M, const size_t K) {
@@ -1048,8 +1050,9 @@ std::vector<std::pair<int, int>> num_tiles = {
   {8, 1},
   {31, 1},
   {1, 31},
-  {2, 63},    // Row-wise per-tile shared memory is below 32 KiB.
-  {2, 64},    // Row-wise falls back after shared-memory row padding.
+  {2, 63},    // Wide strip with too few M tiles: regular fallback.
+  {2, 64},    // Above 32 KiB: regular fallback.
+  {16, 56},   // Wide strip with enough M tiles for per-tile rowwise.
   {1600, 1},  // MXFP8: more row-wise tiles than one CTA per tile allows
 };
 

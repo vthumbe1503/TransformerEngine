@@ -465,6 +465,8 @@ std::vector<std::tuple<int, size_t, size_t, bool>> multi_tensor_test_cases = {
     {2, 128, 8192, false},
     // Rowwise num_tiles_k = 34 selects vec_load_size = 2 (int2 kernel)
     {2, 128, 4352, true},
+    // Wide row-wise strips use per-tile when the batch has enough M tiles.
+    {2, 2048, 7168, true},
     // Colwise num_tiles_k = 512 / 32 / 4 = 4 selects vec_load_size = 4 (int4 kernel)
     {2, 512, 4096, false},
     // MXFP8 swizzle: more tensors than one launch takes, several row-wise tiles per CTA,

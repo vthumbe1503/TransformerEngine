@@ -798,6 +798,8 @@ constexpr int kRowwiseThreadsPerBlock = 128;
 constexpr int kColumnwiseThreadsPerBlock = 256;
 constexpr int kMaxTensorsPerLaunch = 64;
 constexpr int kRowwiseMaxSharedMemoryBytes = 32 * 1024;
+constexpr int kRowwiseAlwaysPerTileSharedMemoryBytes = 16 * 1024;
+constexpr int kRowwiseMinTilesForWideStrip = 16;
 // Row-wise: the largest grid before several tiles share a block.
 constexpr int kRowwiseMaxBlocks = 1536;
 // Column-wise: the largest grid with 32-row chunks before switching to 128-row chunks.
@@ -1008,13 +1010,21 @@ inline bool is_16_byte_aligned(const void* ptr) {
   return (reinterpret_cast<uintptr_t>(ptr) & 15u) == 0;
 }
 
-inline bool per_tile_swizzle_supported(const PerTileSwizzleTensor& tensor, bool rowwise) {
+inline bool per_tile_swizzle_supported(const PerTileSwizzleTensor& tensor, bool rowwise,
+                                       int64_t total_rowwise_tiles = 0) {
   if (tensor.padded_m <= 0 || tensor.padded_k <= 0 || tensor.padded_m % 128 != 0 ||
       tensor.padded_k % 4 != 0) {
     return false;
   }
   if (!is_16_byte_aligned(tensor.input) || !is_16_byte_aligned(tensor.output)) return false;
-  if (rowwise && 128 * ((tensor.padded_k >> 2) | 1) * 4 > kRowwiseMaxSharedMemoryBytes) return false;
+  if (rowwise) {
+    const int smem_bytes = 128 * ((tensor.padded_k >> 2) | 1) * 4;
+    if (smem_bytes > kRowwiseMaxSharedMemoryBytes) return false;
+    if (smem_bytes > kRowwiseAlwaysPerTileSharedMemoryBytes &&
+        total_rowwise_tiles < kRowwiseMinTilesForWideStrip) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1025,15 +1035,22 @@ inline bool per_tile_swizzle_supported(const PerTileSwizzleTensor& tensor, bool 
 // tensor is not supported.
 inline bool launch_multi_tensor_per_tile_swizzle(const PerTileSwizzleTensor* tensors,
                                                  int num_tensors, bool rowwise,
-                                                 cudaStream_t stream) {
+                                                 cudaStream_t stream,
+                                                 int64_t total_rowwise_tiles = -1) {
   if (num_tensors <= 0 || num_tensors > kMaxTensorsPerLaunch) return false;
+  if (rowwise && total_rowwise_tiles < 0) {
+    total_rowwise_tiles = 0;
+    for (int i = 0; i < num_tensors; i++) {
+      total_rowwise_tiles += tensors[i].padded_m / 128;
+    }
+  }
   PerTileMultiSwizzleArgs args;
   args.num_tensors = num_tensors;
   args.first_block[0] = 0;
   int64_t total_tiles = 0;
   int max_smem_row_words = 1;
   for (int i = 0; i < num_tensors; i++) {
-    if (!per_tile_swizzle_supported(tensors[i], rowwise)) return false;
+    if (!per_tile_swizzle_supported(tensors[i], rowwise, total_rowwise_tiles)) return false;
     args.tensors[i] = tensors[i];
     args.words_per_row_magic[i] = division_magic(tensors[i].padded_k >> 2);
     if (rowwise) {
@@ -1085,7 +1102,7 @@ inline bool launch_multi_tensor_per_tile_swizzle(const PerTileSwizzleTensor* ten
 
 inline bool launch_rowwise_per_tile_swizzle(const PerTileSwizzleTensor& tensor,
                                             cudaStream_t stream) {
-  if (!per_tile_swizzle_supported(tensor, true)) return false;
+  if (!per_tile_swizzle_supported(tensor, true, tensor.padded_m / 128)) return false;
   swizzle_rowwise_per_tile_kernel<<<tensor.padded_m / 128, kRowwiseThreadsPerBlock,
                                     128 * ((tensor.padded_k >> 2) | 1) * 4, stream>>>(
       tensor.input, tensor.output, tensor.padded_k, division_magic(tensor.padded_k >> 2),
@@ -1108,7 +1125,8 @@ inline bool launch_columnwise_per_tile_swizzle(const PerTileSwizzleTensor& tenso
 // A single tensor uses the one-tile-per-block kernels unless its grid would be large; several
 // tensors go through one multi-tensor launch.
 inline bool launch_per_tile_swizzle(const PerTileSwizzleTensor* tensors, int num_tensors,
-                                    bool rowwise, cudaStream_t stream) {
+                                    bool rowwise, cudaStream_t stream,
+                                    int64_t total_rowwise_tiles = -1) {
   const bool grid_too_large =
       num_tensors == 1 && (rowwise ? tensors[0].padded_m / 128 > kRowwiseMaxBlocks
                                    : static_cast<int64_t>(tensors[0].padded_m / 128) *
@@ -1118,7 +1136,8 @@ inline bool launch_per_tile_swizzle(const PerTileSwizzleTensor* tensors, int num
     return rowwise ? launch_rowwise_per_tile_swizzle(tensors[0], stream)
                    : launch_columnwise_per_tile_swizzle(tensors[0], stream);
   }
-  return launch_multi_tensor_per_tile_swizzle(tensors, num_tensors, rowwise, stream);
+  return launch_multi_tensor_per_tile_swizzle(tensors, num_tensors, rowwise, stream,
+                                               total_rowwise_tiles);
 }
 
 }  // namespace
@@ -1306,7 +1325,7 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
                                                k,
                                                original_M,
                                                original_K};
-    if (per_tile_swizzle_supported(per_tile_tensor, true)) {
+    if (per_tile_swizzle_supported(per_tile_tensor, true, m / SF_TILE_DIM_M)) {
       launch_per_tile_swizzle(&per_tile_tensor, 1, true, stream);
     } else {
       int n_tiles_in_tb = TB_DIM * vec_load_size;
@@ -1545,11 +1564,19 @@ bool multi_tensor_per_tile_swizzle(const std::vector<Tensor*>& input, std::vecto
                   padded_k,
                   original_m,
                   original_k};
-    if (!per_tile_swizzle_supported(tensors[i], rowwise)) return false;
+  }
+  int64_t total_rowwise_tiles = 0;
+  if (rowwise) {
+    for (const auto& tensor : tensors) {
+      total_rowwise_tiles += tensor.padded_m / 128;
+    }
+  }
+  for (const auto& tensor : tensors) {
+    if (!per_tile_swizzle_supported(tensor, rowwise, total_rowwise_tiles)) return false;
   }
   for (size_t first = 0; first < num_tensors; first += kMaxTensorsPerLaunch) {
     const int count = static_cast<int>(std::min<size_t>(kMaxTensorsPerLaunch, num_tensors - first));
-    launch_per_tile_swizzle(tensors.data() + first, count, rowwise, stream);
+    launch_per_tile_swizzle(tensors.data() + first, count, rowwise, stream, total_rowwise_tiles);
   }
   return true;
 }
