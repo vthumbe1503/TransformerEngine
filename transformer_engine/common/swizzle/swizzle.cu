@@ -797,6 +797,7 @@ bool column_padded_compact_scales(const Tensor& input) {
 constexpr int kRowwiseThreadsPerBlock = 128;
 constexpr int kColumnwiseThreadsPerBlock = 256;
 constexpr int kMaxTensorsPerLaunch = 64;
+constexpr int kRowwiseMaxSharedMemoryBytes = 32 * 1024;
 // Row-wise: the largest grid before several tiles share a block.
 constexpr int kRowwiseMaxBlocks = 1536;
 // Column-wise: the largest grid with 32-row chunks before switching to 128-row chunks.
@@ -825,7 +826,7 @@ inline uint32_t division_magic(int divisor) {
 // Row-wise: tiles [first_tile, first_tile + num_tiles) of one tensor, a contiguous chunk of the
 // input and of the output. Shared-memory rows are padded to an odd number of words, so the column
 // gathers are free of bank conflicts. Requires num_tiles * 128 * padded_k / 4 < 2^16 (guaranteed
-// by the 48 KB shared-memory limit).
+// by the row-wise shared-memory limit).
 __device__ __forceinline__ void swizzle_rowwise_tiles(const uint8_t* __restrict__ input,
                                                       uint8_t* __restrict__ output, int padded_k,
                                                       uint32_t words_per_row_magic, int original_m,
@@ -1013,7 +1014,7 @@ inline bool per_tile_swizzle_supported(const PerTileSwizzleTensor& tensor, bool 
     return false;
   }
   if (!is_16_byte_aligned(tensor.input) || !is_16_byte_aligned(tensor.output)) return false;
-  if (rowwise && 128 * ((tensor.padded_k >> 2) | 1) * 4 > 48 * 1024) return false;
+  if (rowwise && 128 * ((tensor.padded_k >> 2) | 1) * 4 > kRowwiseMaxSharedMemoryBytes) return false;
   return true;
 }
 
@@ -1045,7 +1046,8 @@ inline bool launch_multi_tensor_per_tile_swizzle(const PerTileSwizzleTensor* ten
   }
   int tiles_per_block = 1, chunk_rows = 32;
   if (rowwise) {
-    const int max_tiles_per_block = (48 * 1024) / (128 * max_smem_row_words * 4);
+    const int max_tiles_per_block =
+        kRowwiseMaxSharedMemoryBytes / (128 * max_smem_row_words * 4);
     while (total_tiles > static_cast<int64_t>(kRowwiseMaxBlocks) * tiles_per_block &&
            tiles_per_block * 2 <= max_tiles_per_block) {
       tiles_per_block *= 2;

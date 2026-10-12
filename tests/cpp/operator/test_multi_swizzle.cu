@@ -202,7 +202,7 @@ TEST(MultiTensorSwizzleTest, NVFP4PerTileLaunchSplitting) {
 
 TEST(MultiTensorSwizzleTest, RowwiseMixedSharedMemoryFallback) {
   using namespace test;
-  const std::vector<std::pair<size_t, size_t>> shapes{{160, 12160}, {160, 12288}};
+  const std::vector<std::pair<size_t, size_t>> shapes{{160, 8064}, {160, 8192}};
   std::vector<std::unique_ptr<Tensor>> inputs;
   std::vector<std::unique_ptr<Tensor>> outputs;
   std::vector<NVTETensor> input_handles;
