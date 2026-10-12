@@ -219,10 +219,9 @@ static void zero_scale_inv_padding(uint8_t *buf,
 void performTestSwizzleNVFP4(const size_t M, const size_t K, bool rowwise) {
   using namespace test;
 
-  Tensor input("input", {M, K}, DType::kFloat4E2M1, rowwise, !rowwise,
-               NVTE_NVFP4_1D_SCALING);
-  Tensor output("output", {M, K}, DType::kFloat4E2M1, rowwise, !rowwise,
-                NVTE_NVFP4_1D_SCALING);
+  const std::vector<size_t> shape{M, K};
+  Tensor input("input", shape, DType::kFloat4E2M1, rowwise, !rowwise, NVTE_NVFP4_1D_SCALING);
+  Tensor output("output", shape, DType::kFloat4E2M1, rowwise, !rowwise, NVTE_NVFP4_1D_SCALING);
   output.set_with_gemm_swizzled_scales(true);
   fillUniform(&input);
   input.to_cpu();
