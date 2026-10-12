@@ -223,8 +223,11 @@ void performTestSwizzleNVFP4(const size_t M, const size_t K, bool rowwise) {
   Tensor input("input", shape, DType::kFloat4E2M1, rowwise, !rowwise, NVTE_NVFP4_1D_SCALING);
   Tensor output("output", shape, DType::kFloat4E2M1, rowwise, !rowwise, NVTE_NVFP4_1D_SCALING);
   output.set_with_gemm_swizzled_scales(true);
-  fillUniform(&input);
-  input.to_cpu();
+  if (rowwise) {
+    input.fill_uniform_rowwise_scale_inv();
+  } else {
+    input.fill_uniform_columnwise_scale_inv();
+  }
 
   const NVTEShape scale_shape =
       rowwise ? input.rowwise_scale_inv_shape() : input.columnwise_scale_inv_shape();

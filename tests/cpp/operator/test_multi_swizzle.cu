@@ -157,8 +157,11 @@ void performTestMultiTensorSwizzleNVFP4(const int num_tensors, const size_t M, c
                                            std::vector<size_t>{M, K}, DType::kFloat4E2M1, rowwise,
                                            !rowwise, NVTE_NVFP4_1D_SCALING);
     output->set_with_gemm_swizzled_scales(true);
-    fillUniform(input.get());
-    input->to_cpu();
+    if (rowwise) {
+      input->fill_uniform_rowwise_scale_inv();
+    } else {
+      input->fill_uniform_columnwise_scale_inv();
+    }
     const NVTEShape scale_shape =
         rowwise ? input->rowwise_scale_inv_shape() : input->columnwise_scale_inv_shape();
     uint8_t *scales = rowwise ? input->rowwise_cpu_scale_inv_ptr<uint8_t>()
@@ -213,8 +216,7 @@ TEST(MultiTensorSwizzleTest, RowwiseMixedSharedMemoryFallback) {
                                            std::vector<size_t>{M, K}, DType::kFloat8E4M3, true,
                                            false, NVTE_MXFP8_1D_SCALING);
     output->set_with_gemm_swizzled_scales(true);
-    fillUniform(input.get());
-    input->to_cpu();
+    input->fill_uniform_rowwise_scale_inv();
     const NVTEShape scale_shape = input->rowwise_scale_inv_shape();
     zero_scale_inv_padding(input->rowwise_cpu_scale_inv_ptr<uint8_t>(), scale_shape.data[0],
                            scale_shape.data[1], M, (K + 31) / 32);
