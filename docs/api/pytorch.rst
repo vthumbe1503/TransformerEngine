@@ -34,6 +34,9 @@ PyTorch
 .. autoapiclass:: transformer_engine.pytorch.GatedDeltaProductAttention(num_attention_heads, kv_channels, num_householder=1, **kwargs)
   :members: forward
 
+.. autoapiclass:: transformer_engine.pytorch.KimiDeltaAttention(num_attention_heads, kv_channels, **kwargs)
+  :members: forward
+
 .. autoapiclass:: transformer_engine.pytorch.MultiheadAttention(hidden_size, num_attention_heads, **kwargs)
   :members: forward, set_context_parallel_group, set_tensor_parallel_group
 
@@ -95,6 +98,20 @@ Recipe availability
 
 Mixture of Experts (MoE) functions
 ----------------------------------
+
+``MoeDispatch`` and ``MoeCombine`` use a local PyTorch backend when constructed
+without an ``EpBuffer``. Set ``ep_group=None`` in ``EpConfig`` for EP=1; an
+omitted ``alignment`` then defaults to 0, while distributed groups default to
+256 tokens per expert. All
+experts must be local; BF16 tokens and FP32 routing weights are supported.
+Quantized communication and receive-capacity overflow policies require a
+different backend.
+
+.. autoapiclass:: transformer_engine.pytorch.ep.EpConfig
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeDispatch
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeCombine
 
 .. autoapifunction:: transformer_engine.pytorch.moe_permute
 
