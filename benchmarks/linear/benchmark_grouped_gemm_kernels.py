@@ -47,6 +47,11 @@ Run only MXFP8 FC1 wgrad:
 
     python benchmarks/linear/benchmark_grouped_gemm_kernels.py \
         --precision mxfp8 --projection fc1 --gemm wgrad
+
+Compare grouped-average heuristic hints on a jagged DeepSeek-style workload:
+
+    python benchmarks/linear/benchmark_grouped_gemm_kernels.py \
+        --workload deepseek-jagged --heuristic-mode all
 """
 
 import argparse
@@ -74,13 +79,16 @@ from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 from transformer_engine.pytorch.tensor import GroupedTensor, GroupedTensorStorage
 import transformer_engine_torch as tex
 
-
 QWEN_NUM_EXPERTS = 512
 QWEN_TOP_K = 10
 QWEN_SEQUENCE_LENGTH = 4096
 QWEN_EXPERT_PARALLEL_SIZE = 32
 QWEN_HIDDEN_SIZE = 4096
 QWEN_MOE_INTERMEDIATE_SIZE = 1024
+DEEPSEEK_HIDDEN_SIZE = 7168
+DEEPSEEK_MOE_INTERMEDIATE_SIZE = 2048
+DEEPSEEK_UNIFORM_SPLITS = [8192] * 8
+DEEPSEEK_JAGGED_SPLITS = [10240, 6144, 9728, 7680, 4608, 11264, 7168, 8704]
 
 
 @dataclass(frozen=True)
@@ -100,6 +108,11 @@ GEMM_SPECS = tuple(
         ("fc1", QWEN_HIDDEN_SIZE, 2 * QWEN_MOE_INTERMEDIATE_SIZE),
         ("fc2", QWEN_MOE_INTERMEDIATE_SIZE, QWEN_HIDDEN_SIZE),
     )
+    for gemm, layout in (("fwd", "TN"), ("dgrad", "NN"), ("wgrad", "NT"))
+)
+
+DEEPSEEK_GEMM_SPECS = tuple(
+    GemmSpec("expert", gemm, layout, DEEPSEEK_HIDDEN_SIZE, DEEPSEEK_MOE_INTERMEDIATE_SIZE)
     for gemm, layout in (("fwd", "TN"), ("dgrad", "NN"), ("wgrad", "NT"))
 )
 
@@ -331,8 +344,13 @@ def _use_split_accumulator(spec: GemmSpec) -> bool:
     return _2X_ACC_WGRAD
 
 
-def _run_multistream(prepared: PreparedGemm, iterations: int) -> None:
+def _run_multistream(
+    prepared: PreparedGemm,
+    iterations: int,
+    heuristic_hints: Optional[tuple[int, int, int]] = None,
+) -> None:
     """Launch the multi-stream grouped GEMM repeatedly."""
+    del heuristic_hints
     spec = prepared.spec
     for _ in range(iterations):
         general_grouped_gemm(
@@ -349,8 +367,13 @@ def _run_multistream(prepared: PreparedGemm, iterations: int) -> None:
         )
 
 
-def _run_cublas_grouped(prepared: PreparedGemm, iterations: int) -> None:
+def _run_cublas_grouped(
+    prepared: PreparedGemm,
+    iterations: int,
+    heuristic_hints: Optional[tuple[int, int, int]] = None,
+) -> None:
     """Launch the device-described cuBLASLt grouped GEMM repeatedly."""
+    avg_m, avg_n, avg_k = heuristic_hints or (None, None, None)
     for _ in range(iterations):
         general_grouped_gemm_for_grouped_tensor(
             prepared.grouped_a,
@@ -358,6 +381,9 @@ def _run_cublas_grouped(prepared: PreparedGemm, iterations: int) -> None:
             prepared.grouped_out,
             layout=prepared.spec.layout,
             use_split_accumulator=_use_split_accumulator(prepared.spec),
+            avg_m=avg_m,
+            avg_n=avg_n,
+            avg_k=avg_k,
         )
 
 
@@ -372,10 +398,14 @@ def _canonical_output(prepared: PreparedGemm, *, grouped: bool) -> torch.Tensor:
     return output[0]
 
 
-def _validate_outputs(prepared: PreparedGemm, precision: str) -> None:
+def _validate_outputs(
+    prepared: PreparedGemm,
+    precision: str,
+    heuristic_hints: Optional[tuple[int, int, int]] = None,
+) -> None:
     """Check that execution-path selection does not change GEMM numerics unexpectedly."""
     _run_multistream(prepared, 1)
-    _run_cublas_grouped(prepared, 1)
+    _run_cublas_grouped(prepared, 1, heuristic_hints)
     if precision == "mxfp8":
         tolerances = {"rtol": 0.125, "atol": 0.0675}
     else:
@@ -396,20 +426,22 @@ def _benchmark_path(
     min_run_time: float,
     profile: bool,
     label: str,
+    heuristic_hints: Optional[tuple[int, int, int]] = None,
 ) -> float:
     """Return milliseconds for one grouped GEMM launch."""
     run = _run_multistream if path == "multistream" else _run_cublas_grouped
-    run(prepared, warmup_iterations)
+    run(prepared, warmup_iterations, heuristic_hints)
     torch.cuda.synchronize()
 
     if profile:
         torch.cuda.nvtx.range_push(label)
     timing = benchmark.Timer(
-        stmt="run(prepared, iterations_per_run)",
+        stmt="run(prepared, iterations_per_run, heuristic_hints)",
         globals={
             "run": run,
             "prepared": prepared,
             "iterations_per_run": iterations_per_run,
+            "heuristic_hints": heuristic_hints,
         },
         num_threads=1,
     ).blocked_autorange(min_run_time=min_run_time)
@@ -437,11 +469,61 @@ def _shape_description(spec: GemmSpec, rows_per_expert: str) -> str:
     return f"A[{rows_per_expert},{spec.k}] B[{rows_per_expert},{spec.n}] -> D[{spec.n},{spec.k}]"
 
 
+def _exact_heuristic_hints(spec: GemmSpec, split_sizes: list[int]) -> tuple[int, int, int]:
+    """Return average dimensions in cuBLASLt's column-major D convention."""
+    avg_rows = sum(split_sizes) // len(split_sizes)
+    if spec.gemm == "fwd":
+        return spec.n, avg_rows, spec.k
+    if spec.gemm == "dgrad":
+        return spec.k, avg_rows, spec.n
+    return spec.k, spec.n, avg_rows
+
+
+def _heuristic_modes(
+    requested_mode: str,
+    spec: GemmSpec,
+    split_sizes: list[int],
+    explicit_hints: tuple[Optional[int], Optional[int], Optional[int]],
+) -> list[tuple[str, Optional[tuple[int, int, int]]]]:
+    """Build the heuristic variants requested by the CLI."""
+    exact = _exact_heuristic_hints(spec, split_sizes)
+    modes: dict[str, Optional[tuple[int, int, int]]] = {
+        "auto": None,
+        "exact": exact,
+        "zero": (0, 0, 0),
+        "swapped": (exact[1], exact[0], exact[2]),
+    }
+    if all(value is not None for value in explicit_hints):
+        modes["explicit"] = tuple(int(value) for value in explicit_hints)
+    elif any(value is not None for value in explicit_hints):
+        raise ValueError("--avg-m, --avg-n, and --avg-k must be specified together.")
+
+    if requested_mode == "all":
+        return list(modes.items())
+    if requested_mode == "explicit" and "explicit" not in modes:
+        raise ValueError("Explicit heuristic mode requires --avg-m, --avg-n, and --avg-k.")
+    return [(requested_mode, modes[requested_mode])]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--precision", choices=("all", "bf16", "mxfp8"), default="all")
-    parser.add_argument("--projection", choices=("all", "fc1", "fc2"), default="all")
+    parser.add_argument("--projection", choices=("all", "fc1", "fc2", "expert"), default="all")
     parser.add_argument("--gemm", choices=("all", "fwd", "dgrad", "wgrad"), default="all")
+    parser.add_argument(
+        "--workload",
+        choices=("qwen", "deepseek-uniform", "deepseek-jagged"),
+        default="qwen",
+    )
+    parser.add_argument(
+        "--heuristic-mode",
+        choices=("all", "auto", "exact", "zero", "swapped", "explicit"),
+        default="all",
+        help="cuBLASLt grouped-average hints to benchmark.",
+    )
+    parser.add_argument("--avg-m", type=int, default=None)
+    parser.add_argument("--avg-n", type=int, default=None)
+    parser.add_argument("--avg-k", type=int, default=None)
     parser.add_argument("--iterations-per-run", type=int, default=1000)
     parser.add_argument("--warmup-iterations", type=int, default=500)
     parser.add_argument("--min-run-time", type=float, default=5.0)
@@ -470,24 +552,31 @@ def main() -> None:
     if args.iterations_per_run < 1 or args.warmup_iterations < 1:
         raise ValueError("iterations-per-run and warmup-iterations must be positive.")
 
-    if args.m_splits is None:
-        num_local_experts = QWEN_NUM_EXPERTS // QWEN_EXPERT_PARALLEL_SIZE
-        rows_per_expert = QWEN_SEQUENCE_LENGTH * QWEN_TOP_K // num_local_experts
-        split_sizes = [rows_per_expert] * num_local_experts
-    else:
+    if args.m_splits is not None:
         split_sizes = [int(value) for value in args.m_splits.split(",") if value]
         if not split_sizes or any(value <= 0 for value in split_sizes):
             raise ValueError("m_splits must contain positive integers.")
-        num_local_experts = len(split_sizes)
+    elif args.workload == "qwen":
+        num_local_experts = QWEN_NUM_EXPERTS // QWEN_EXPERT_PARALLEL_SIZE
+        rows_per_expert = QWEN_SEQUENCE_LENGTH * QWEN_TOP_K // num_local_experts
+        split_sizes = [rows_per_expert] * num_local_experts
+    elif args.workload == "deepseek-uniform":
+        split_sizes = DEEPSEEK_UNIFORM_SPLITS
+    else:
+        split_sizes = DEEPSEEK_JAGGED_SPLITS
 
+    num_local_experts = len(split_sizes)
     total_rows = sum(split_sizes)
     precisions = ("bf16", "mxfp8") if args.precision == "all" else (args.precision,)
+    workload_specs = GEMM_SPECS if args.workload == "qwen" else DEEPSEEK_GEMM_SPECS
     specs = [
         spec
-        for spec in GEMM_SPECS
+        for spec in workload_specs
         if (args.projection == "all" or spec.projection == args.projection)
         and (args.gemm == "all" or spec.gemm == args.gemm)
     ]
+    if not specs:
+        raise ValueError(f"Projection {args.projection!r} is not part of {args.workload!r}.")
     recipes: dict[str, Optional[Recipe]] = {
         "bf16": None,
         "mxfp8": MXFP8BlockScaling(),
@@ -495,7 +584,11 @@ def main() -> None:
     mxfp8_available, reason_for_no_mxfp8 = FP8GlobalStateManager.is_mxfp8_available()
 
     uniform_rows = str(split_sizes[0]) if len(set(split_sizes)) == 1 else "variable"
-    print("Qwen3.5-397B-A17B grouped GEMM kernel benchmark")
+    print(f"{args.workload} grouped GEMM kernel benchmark")
+    print(f"  GPU: {torch.cuda.get_device_name()}")
+    print(f"  compute capability: {torch.cuda.get_device_capability()}")
+    print(f"  PyTorch: {torch.__version__}; CUDA: {torch.version.cuda}")
+    print(f"  cuBLASLt: {tex.get_cublasLt_version()}")
     print(f"  local experts: {num_local_experts}")
     print(f"  total rows: {total_rows}")
     print(f"  m_splits: {split_sizes}")
@@ -525,49 +618,85 @@ def main() -> None:
             torch.manual_seed(args.seed)
             torch.cuda.manual_seed(args.seed)
             prepared = _prepare_gemm(spec, split_sizes, precision)
-            if not args.skip_correctness:
-                _validate_outputs(prepared, precision)
+            baseline_ms = _benchmark_path(
+                prepared,
+                path="multistream",
+                iterations_per_run=args.iterations_per_run,
+                warmup_iterations=args.warmup_iterations,
+                min_run_time=args.min_run_time,
+                profile=args.profile,
+                label=f"{precision}_{spec.projection}_{spec.gemm}_multistream",
+            )
+            rows.append(
+                {
+                    "workload": args.workload,
+                    "precision": precision,
+                    "projection": spec.projection,
+                    "gemm": spec.gemm,
+                    "layout": spec.layout,
+                    "execution_path": "multistream",
+                    "heuristic_mode": "n/a",
+                    "avg_m": None,
+                    "avg_n": None,
+                    "avg_k": None,
+                    "num_local_experts": num_local_experts,
+                    "total_rows": total_rows,
+                    "k": spec.k,
+                    "n": spec.n,
+                    "time_ms": baseline_ms,
+                    "tflops": _gemm_tflops(spec, total_rows, baseline_ms),
+                    "speedup_vs_multistream": 1.0,
+                }
+            )
 
-            timings = {}
-            for path in ("multistream", "cublas_grouped_gemm"):
-                label = f"{precision}_{spec.projection}_{spec.gemm}_{path}"
-                timings[path] = _benchmark_path(
+            explicit = (args.avg_m, args.avg_n, args.avg_k)
+            for heuristic_mode, heuristic_hints in _heuristic_modes(
+                args.heuristic_mode, spec, split_sizes, explicit
+            ):
+                if not args.skip_correctness:
+                    _validate_outputs(prepared, precision, heuristic_hints)
+                label = (
+                    f"{precision}_{spec.projection}_{spec.gemm}" f"_cublas_grouped_{heuristic_mode}"
+                )
+                time_ms = _benchmark_path(
                     prepared,
-                    path=path,
+                    path="cublas_grouped_gemm",
                     iterations_per_run=args.iterations_per_run,
                     warmup_iterations=args.warmup_iterations,
                     min_run_time=args.min_run_time,
                     profile=args.profile,
                     label=label,
+                    heuristic_hints=heuristic_hints,
                 )
-
-            speedup = timings["multistream"] / timings["cublas_grouped_gemm"]
-            for path, time_ms in timings.items():
+                speedup = baseline_ms / time_ms
+                avg_m, avg_n, avg_k = heuristic_hints or (None, None, None)
                 rows.append(
                     {
+                        "workload": args.workload,
                         "precision": precision,
                         "projection": spec.projection,
                         "gemm": spec.gemm,
                         "layout": spec.layout,
-                        "execution_path": path,
+                        "execution_path": "cublas_grouped_gemm",
+                        "heuristic_mode": heuristic_mode,
+                        "avg_m": avg_m,
+                        "avg_n": avg_n,
+                        "avg_k": avg_k,
                         "num_local_experts": num_local_experts,
                         "total_rows": total_rows,
                         "k": spec.k,
                         "n": spec.n,
                         "time_ms": time_ms,
                         "tflops": _gemm_tflops(spec, total_rows, time_ms),
-                        "speedup_vs_multistream": (
-                            speedup if path == "cublas_grouped_gemm" else 1.0
-                        ),
+                        "speedup_vs_multistream": speedup,
                     }
                 )
 
-            print(
-                f"{precision:6s} {spec.projection} {spec.gemm:5s}: "
-                f"multistream={timings['multistream']:.3f} ms, "
-                f"cuBLAS grouped={timings['cublas_grouped_gemm']:.3f} ms, "
-                f"speedup={speedup:.3f}x"
-            )
+                print(
+                    f"{precision:6s} {spec.projection} {spec.gemm:5s} {heuristic_mode:7s}: "
+                    f"multistream={baseline_ms:.3f} ms, "
+                    f"cuBLAS grouped={time_ms:.3f} ms, speedup={speedup:.3f}x"
+                )
 
     results = pd.DataFrame(rows)
     print()

@@ -1256,6 +1256,60 @@ def test_grouped_gemm_grouped_tensor(z, m, n, k, case, layout, accumulate, use_b
             torch.testing.assert_close(o, o_ref, **tols)
 
 
+@pytest.mark.parametrize("bad_hint", [-1, 2**32])
+def test_grouped_gemm_average_dimension_hints(bad_hint) -> None:
+    """Explicit grouped heuristic hints are honored and checked at the cuBLASLt boundary."""
+    if not is_module_grouped_tensor_path_supported(None, torch.bfloat16):
+        pytest.skip("BF16 GroupedTensor GEMM is unavailable.")
+
+    num_groups = 4
+    m_sizes = [64, 128, 192, 256]
+    in_features = 128
+    out_features = 256
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    weights = [
+        torch.randn(out_features, in_features, dtype=dtype, device=device)
+        for _ in range(num_groups)
+    ]
+    inputs = [torch.randn(m, in_features, dtype=dtype, device=device) for m in m_sizes]
+    grouped_weights = _make_grouped_tensor_uniform(
+        num_groups, out_features, in_features, device, dtype
+    )
+    grouped_input = _make_grouped_tensor_from_splits(m_sizes, in_features, device, dtype)
+    grouped_output = _make_grouped_tensor_from_splits(m_sizes, out_features, device, dtype)
+    _pack_grouped_tensor(grouped_weights, weights)
+    _pack_grouped_tensor(grouped_input, inputs)
+
+    general_grouped_gemm_for_grouped_tensor(
+        grouped_weights,
+        grouped_input,
+        grouped_output,
+        layout="TN",
+        avg_m=out_features,
+        avg_n=sum(m_sizes) // num_groups,
+        avg_k=in_features,
+    )
+    for output, inp, weight in zip(grouped_output.split_into_quantized_tensors(), inputs, weights):
+        torch.testing.assert_close(
+            output,
+            torch.matmul(inp.float(), weight.float().transpose(0, 1)).to(dtype),
+            **dtype_tols(dtype),
+        )
+
+    with pytest.raises(RuntimeError, match="avg_m must be in"):
+        general_grouped_gemm_for_grouped_tensor(
+            grouped_weights,
+            grouped_input,
+            grouped_output,
+            layout="TN",
+            avg_m=bad_hint,
+            avg_n=sum(m_sizes) // num_groups,
+            avg_k=in_features,
+        )
+
+
 @pytest.mark.parametrize("use_bias_scale", [False, True])
 def test_grouped_gemm_grouped_tensor_zero_work_bias(use_bias_scale) -> None:
     """A grouped bias operation is a no-op when every group has zero rows.

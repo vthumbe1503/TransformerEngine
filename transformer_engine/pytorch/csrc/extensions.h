@@ -177,7 +177,8 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,
     std::optional<at::Tensor> bias_scale, at::Tensor alpha, at::Tensor beta,
     at::Tensor workspace_setup, at::Tensor workspace_cublas, bool use_split_accumulator,
-    int math_sm_count);
+    int math_sm_count, std::optional<int64_t> avg_m, std::optional<int64_t> avg_n,
+    std::optional<int64_t> avg_k);
 
 py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py::handle B,
                                                    bool transb, py::handle D, py::object bias,
@@ -185,7 +186,10 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
                                                    at::Tensor alpha, at::Tensor beta,
                                                    at::Tensor workspace_setup,
                                                    at::Tensor workspace_cublas,
-                                                   bool use_split_accumulator, int math_sm_count);
+                                                   bool use_split_accumulator, int math_sm_count,
+                                                   std::optional<int64_t> avg_m,
+                                                   std::optional<int64_t> avg_n,
+                                                   std::optional<int64_t> avg_k);
 
 py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, py::handle B,
                                                     bool transb, py::handle D, py::object bias,
@@ -193,7 +197,10 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     at::Tensor alpha, at::Tensor beta,
                                                     at::Tensor workspace_setup,
                                                     at::Tensor workspace_cublas,
-                                                    bool use_split_accumulator, int math_sm_count);
+                                                    bool use_split_accumulator, int math_sm_count,
+                                                    std::optional<int64_t> avg_m,
+                                                    std::optional<int64_t> avg_n,
+                                                    std::optional<int64_t> avg_k);
 
 /***************************************************************************************************
  * Transpose

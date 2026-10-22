@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -1022,17 +1023,33 @@ inline cublasLtMatmulAlgo_t select_grouped_gemm_algo(
     cublasLtMatrixLayoutOpaque_t &descA, cublasLtMatrixLayoutOpaque_t &descB,
     cublasLtMatrixLayoutOpaque_t &descC, cublasLtMatrixLayoutOpaque_t &descD, int64_t avg_m,
     int64_t avg_n, int64_t avg_k, bool filter_unsafe_algos) {
+  // cuBLASLt documents these attributes as uint32_t, but cuBLASLt 13.8 rejects a
+  // four-byte payload with CUBLAS_STATUS_INVALID_VALUE and requires an int64_t payload.
+  // Keep the runtime-required payload size while enforcing the documented value range.
+  auto to_cublas_average = [](int64_t value, const char *name) {
+    NVTE_CHECK(value >= 0 && static_cast<uint64_t>(value) <= std::numeric_limits<uint32_t>::max(),
+               "Grouped GEMM: ", name, " must be in [0, ",
+               std::numeric_limits<uint32_t>::max(), "], got ", value);
+    return value;
+  };
+  const int64_t cublas_avg_m = to_cublas_average(avg_m, "avg_m");
+  const int64_t cublas_avg_n = to_cublas_average(avg_n, "avg_n");
+  const int64_t cublas_avg_k = to_cublas_average(avg_k, "avg_k");
+
   cublasLtMatmulPreferenceOpaque_t preference;
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceInit(&preference));
   NVTE_CHECK_CUBLAS(
       cublasLtMatmulPreferenceSetAttribute(&preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                            &kGroupedGemmCublasWorkspaceSize, sizeof(size_t)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_ROWS, &avg_m, sizeof(int64_t)));
+      &preference, CUBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_ROWS, &cublas_avg_m,
+      sizeof(cublas_avg_m)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_COLS, &avg_n, sizeof(int64_t)));
+      &preference, CUBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_COLS, &cublas_avg_n,
+      sizeof(cublas_avg_n)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
-      &preference, CUBLASLT_MATMUL_PREF_GROUPED_AVERAGE_REDUCTION_DIM, &avg_k, sizeof(int64_t)));
+      &preference, CUBLASLT_MATMUL_PREF_GROUPED_AVERAGE_REDUCTION_DIM, &cublas_avg_k,
+      sizeof(cublas_avg_k)));
 
   constexpr int kMaxHeuristicResults = 32;
   const int requested_results = filter_unsafe_algos ? kMaxHeuristicResults : 1;

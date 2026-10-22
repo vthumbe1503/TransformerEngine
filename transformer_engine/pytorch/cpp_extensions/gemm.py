@@ -1120,6 +1120,9 @@ def general_grouped_gemm_for_grouped_tensor(
     grad: bool = False,
     alpha: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
+    avg_m: Optional[int] = None,
+    avg_n: Optional[int] = None,
+    avg_k: Optional[int] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
     Grouped GEMM using GroupedTensor inputs.
@@ -1223,4 +1226,7 @@ def general_grouped_gemm_for_grouped_tensor(
         workspace_cublas,
         use_split_accumulator,
         sm_count,
+        avg_m,
+        avg_n,
+        avg_k,
     )

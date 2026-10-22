@@ -100,7 +100,10 @@ struct GroupedGemmConfig {
 GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
                                               at::Tensor workspace_setup,
                                               at::Tensor workspace_cublas, size_t num_tensors,
-                                              int math_sm_count, bool use_split_accumulator) {
+                                              int math_sm_count, bool use_split_accumulator,
+                                              std::optional<int64_t> avg_m,
+                                              std::optional<int64_t> avg_n,
+                                              std::optional<int64_t> avg_k) {
   const bool per_group = (alpha.numel() == static_cast<int64_t>(num_tensors));
   const bool scalar = (alpha.numel() == 1);
   NVTE_CHECK(per_group || scalar, "Grouped GEMM expects alpha to have 1 or num_tensors (",
@@ -121,12 +124,22 @@ GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
       std::nullopt,
   };
 
-  if (math_sm_count > 0 || use_split_accumulator) {
+  if (math_sm_count > 0 || use_split_accumulator || avg_m.has_value() || avg_n.has_value() ||
+      avg_k.has_value()) {
     grouped_gemm_config.matmul_config.emplace();
     if (math_sm_count > 0) {
       grouped_gemm_config.matmul_config->set_sm_count(math_sm_count);
     }
     grouped_gemm_config.matmul_config->set_use_split_accumulator(use_split_accumulator);
+    if (avg_m.has_value()) {
+      grouped_gemm_config.matmul_config->set_avg_m(*avg_m);
+    }
+    if (avg_n.has_value()) {
+      grouped_gemm_config.matmul_config->set_avg_n(*avg_n);
+    }
+    if (avg_k.has_value()) {
+      grouped_gemm_config.matmul_config->set_avg_k(*avg_k);
+    }
   }
 
   return grouped_gemm_config;
@@ -652,7 +665,8 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,
     std::optional<at::Tensor> bias_scale, at::Tensor alpha, at::Tensor beta,
     at::Tensor workspace_setup, at::Tensor workspace_cublas, bool use_split_accumulator,
-    int math_sm_count) {
+    int math_sm_count, std::optional<int64_t> avg_m, std::optional<int64_t> avg_n,
+    std::optional<int64_t> avg_k) {
   using namespace transformer_engine::pytorch::detail;
 
   init_extension();
@@ -674,7 +688,8 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
              "Grouped GEMM requires D to have the same num_tensors as inputs.");
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                                 num_tensors, math_sm_count, use_split_accumulator);
+                                                 num_tensors, math_sm_count, use_split_accumulator,
+                                                 avg_m, avg_n, avg_k);
 
   [[maybe_unused]] auto swizzled_scales_A =
       maybe_swizzle_grouped_tensor(grouped_A, transa, !transa);
@@ -716,7 +731,10 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
                                                    at::Tensor alpha, at::Tensor beta,
                                                    at::Tensor workspace_setup,
                                                    at::Tensor workspace_cublas,
-                                                   bool use_split_accumulator, int math_sm_count) {
+                                                   bool use_split_accumulator, int math_sm_count,
+                                                   std::optional<int64_t> avg_m,
+                                                   std::optional<int64_t> avg_n,
+                                                   std::optional<int64_t> avg_k) {
   using namespace transformer_engine::pytorch::detail;
 
   init_extension();
@@ -738,7 +756,8 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
              "Grouped GEMM requires D to have the same num_tensors as inputs.");
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                                 num_tensors, math_sm_count, use_split_accumulator);
+                                                 num_tensors, math_sm_count, use_split_accumulator,
+                                                 avg_m, avg_n, avg_k);
 
   std::vector<TensorWrapper> te_A_wrappers;
   std::vector<NVTETensor> te_A_vector;
@@ -793,7 +812,10 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     at::Tensor alpha, at::Tensor beta,
                                                     at::Tensor workspace_setup,
                                                     at::Tensor workspace_cublas,
-                                                    bool use_split_accumulator, int math_sm_count) {
+                                                    bool use_split_accumulator, int math_sm_count,
+                                                    std::optional<int64_t> avg_m,
+                                                    std::optional<int64_t> avg_n,
+                                                    std::optional<int64_t> avg_k) {
   using namespace transformer_engine::pytorch::detail;
 
   init_extension();
@@ -817,7 +839,8 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
              "Grouped GEMM requires D_list to have num_tensors elements.");
 
   auto gemm_config = prepare_grouped_gemm_config(alpha, beta, workspace_setup, workspace_cublas,
-                                                 num_tensors, math_sm_count, use_split_accumulator);
+                                                 num_tensors, math_sm_count, use_split_accumulator,
+                                                 avg_m, avg_n, avg_k);
 
   std::vector<TensorWrapper> te_D_wrappers;
   std::vector<NVTETensor> te_D_vector;
